@@ -1,9 +1,11 @@
 // app/src/main/java/com/example/HeartSync/data/remote/PpgRepository.kt
 package com.example.heartsync.data.remote
 
+import android.util.Log
 import com.example.heartsync.data.model.PpgEvent
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.Source
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -14,6 +16,7 @@ import kotlinx.coroutines.tasks.await
 class PpgRepository(
     private val db: FirebaseFirestore
 ) {
+
     private fun col(userId: String, sessionId: String) =
         db.collection("ppg_events")
             .document(userId)
@@ -22,6 +25,9 @@ class PpgRepository(
             .collection("records")
 
     suspend fun uploadRecord(userId: String, sessionId: String, ev: PpgEvent): String {
+
+        val path = "ppg_events/$userId/sessions/$sessionId/records"
+
         val map = hashMapOf(
             "event" to ev.event,
             "host_time_iso" to ev.host_time_iso,
@@ -45,9 +51,26 @@ class PpgRepository(
             "server_ts" to FieldValue.serverTimestamp()
         )
 
-        val ref = col(userId, sessionId).document()
-        ref.set(map).await()
-        return ref.id
+        return try {
+            // 디버깅용 간단 요약 로그
+            android.util.Log.d("PpgRepo",
+                "write try: $path  event=${ev.event} ts_ms=${ev.ts_ms} " +
+                        "AmpRatio=${ev.AmpRatio} leftAmp=${ev.ampL} rightAmp=${ev.ampR}"
+            )
+
+            val ref = col(userId, sessionId).document()
+            ref.set(map).await()
+
+            // 서버에서 강제 읽기 (오프라인/퍼미션 문제면 여기서 예외)
+            val snap = ref.get(Source.SERVER).await()
+            Log.d("PpgRepo", "server read ok: exists=${snap.exists()}")
+
+            android.util.Log.d("PpgRepo", "write OK: $path/${ref.id}")
+            ref.id
+        } catch (t: Throwable) {
+            android.util.Log.e("PpgRepo", "write FAIL: $path", t)
+            throw t
+        }
     }
 
     /**

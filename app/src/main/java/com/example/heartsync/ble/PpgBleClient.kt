@@ -20,7 +20,7 @@ import java.util.concurrent.LinkedBlockingQueue
 
 /**
  * HeartSync BLE 클라이언트
- * - GATT 133 회피: 연결 순서 정석화 (discover → MTU → CCCD), 완전 종료, (선택) 캐시 refresh
+ * - GATT 133 회피: 연결 순서 (discover → MTU → CCCD)
  */
 class PpgBleClient(
     private val ctx: Context,
@@ -63,10 +63,8 @@ class PpgBleClient(
     private val descriptorQueue = LinkedBlockingQueue<BluetoothGattDescriptor>()
     private var scanCallback: ScanCallback? = null
 
-    // ★ 추가: Notify 조각들을 \n 기준으로 한 줄로 합치는 버퍼
+    // 라인 프레이머 (Notify 조각 → \n 단위 줄)
     private val lineBuf = StringBuilder()
-
-    // ★ 추가: 바이트 스트림 → 한 줄씩 콜백으로 전달
     private fun feedBytesAndEmitLines(bytes: ByteArray) {
         val s = try { bytes.toString(Charsets.UTF_8) } catch (_: Exception) { return }
         lineBuf.append(s)
@@ -75,7 +73,10 @@ class PpgBleClient(
             if (idx < 0) break
             val line = lineBuf.substring(0, idx).trimEnd('\r')
             lineBuf.delete(0, idx + 1)
-            if (line.isNotBlank()) onLine(line)
+            if (line.isNotBlank()) {
+                Log.d("BLE", "feed line -> $line")
+                onLine(line)
+            }
         }
     }
 
@@ -221,7 +222,6 @@ class PpgBleClient(
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     backoffMs = 1500
-                    // 서비스 검색 먼저(여기서 MTU 요청 금지)
                     g.discoverServices()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -239,16 +239,18 @@ class PpgBleClient(
             }
 
             val svc = g.getService(this@PpgBleClient.serviceUuid)
-            if (svc == null) { _connectionState.value = ConnectionState.Failed("서비스 UUID 미일치"); return }
+            if (svc == null) {
+                Log.e("BLE", "Service not found: $serviceUuid")
+                _connectionState.value = ConnectionState.Failed("서비스 UUID 미일치"); return
+            }
 
-            // 연결 성공 상태 업데이트
             val dev = BleDevice(g.device?.name, g.device?.address ?: "Unknown")
             _connectionState.value = ConnectionState.Connected(dev)
 
-            // MTU 먼저 요청 → onMtuChanged에서 CCCD 진행
             val ok = g.requestMtu(185)
+            Log.d("BLE", "requestMtu(185) -> $ok (콜백은 onMtuChanged)")
             if (!ok) {
-                // 일부 단말은 false 반환해도 콜백이 올 수 있음 → 안전하게 바로 알림 등록 시도
+                Log.w("BLE", "requestMtu returned false, enabling notifications immediately")
                 enableNotifications(g, svc)
             }
         }
@@ -257,6 +259,7 @@ class PpgBleClient(
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
             Log.d("BLE", "onMtuChanged mtu=$mtu status=$status")
             val svc = g.getService(this@PpgBleClient.serviceUuid) ?: run {
+                Log.e("BLE", "Service missing on onMtuChanged")
                 if (hasConnectPerm()) g.disconnect()
                 return
             }
@@ -265,30 +268,63 @@ class PpgBleClient(
 
         @SuppressLint("MissingPermission")
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            Log.d("BLE", "onDescriptorWrite status=$status")
+            Log.d("BLE", "onDescriptorWrite status=$status desc=${descriptor.uuid} char=${descriptor.characteristic.uuid}")
             writeNextDescriptor()
+            if (descriptorQueue.isEmpty()) {
+                Log.d("BLE", "All CCCDs written. Waiting for onCharacteristicChanged...")
+            }
         }
 
         @SuppressLint("MissingPermission")
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
             val bytes = ch.value ?: return
-            // ★ 수정: 조각을 바로 문자열로 trim하지 말고, 라인 프레이머로 누적 후 \n 단위로 전달
+            Log.d("BLE", "notify bytes=${bytes.size} from ${ch.uuid}")
             feedBytesAndEmitLines(bytes)
         }
     }
 
+    // ===== Notify/Indicate 등록 =====
     @SuppressLint("MissingPermission")
     private fun enableNotifications(g: BluetoothGatt, svc: BluetoothGattService) {
-        // 여러 특성에 대해 순차적으로 CCCD 등록 (큐 사용)
         descriptorQueue.clear()
+
         for (uuid in notifyCharUuids) {
-            val ch = svc.getCharacteristic(uuid) ?: continue
+            val ch = svc.getCharacteristic(uuid)
+            if (ch == null) {
+                Log.e("BLE", "Notify characteristic not found: $uuid")
+                continue
+            }
+
+            val props = ch.properties
+            val hasNotify = (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
+            val hasIndicate = (props and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+
+            if (!hasNotify && !hasIndicate) {
+                Log.e("BLE", "Char $uuid has neither NOTIFY nor INDICATE")
+                continue
+            }
+
             val ok = try { g.setCharacteristicNotification(ch, true) } catch (_: SecurityException) { false }
-            if (!ok) continue
-            val cccd = ch.getDescriptor(cccdUuid) ?: continue
-            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            if (!ok) {
+                Log.e("BLE", "setCharacteristicNotification failed for $uuid")
+                continue
+            }
+
+            val cccd = ch.getDescriptor(cccdUuid)
+            if (cccd == null) {
+                Log.e("BLE", "CCCD not found for $uuid")
+                continue
+            }
+
+            cccd.value = if (hasNotify)
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            else
+                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+
+            Log.d("BLE", "Queue CCCD write for $uuid (notify=$hasNotify indicate=$hasIndicate)")
             descriptorQueue.add(cccd)
         }
+
         writeNextDescriptor()
     }
 
@@ -296,12 +332,13 @@ class PpgBleClient(
     private fun writeNextDescriptor() {
         val d = descriptorQueue.poll() ?: return
         try {
+            val value = d.value ?: BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
             if (Build.VERSION.SDK_INT >= 33) {
-                gatt?.writeDescriptor(d, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                gatt?.writeDescriptor(d, value)
             } else {
                 @Suppress("DEPRECATION")
                 run {
-                    d.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    d.value = value
                     gatt?.writeDescriptor(d)
                 }
             }

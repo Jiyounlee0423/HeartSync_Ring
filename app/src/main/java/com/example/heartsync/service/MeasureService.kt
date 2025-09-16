@@ -43,6 +43,10 @@ class MeasureService : Service() {
     override fun onCreate() {
         super.onCreate()
 
+        val app = com.google.firebase.FirebaseApp.getInstance()
+        val opt = app.options
+        Log.d("FB", "proj=${opt.projectId}, appId=${opt.applicationId}, dbUrl=${opt.databaseUrl}")
+
         // 포그라운드 알림 채널 보장
         NotificationHelper.ensureChannel(this, NOTI_CHANNEL_ID, "HeartSync Measure")
 
@@ -145,75 +149,94 @@ class MeasureService : Service() {
 
     // CSV 한 줄 → Firestore 업로드
     private suspend fun handleLine(line: String) {
-        val ev = parseCsvLineToEvent(line) ?: return
+        Log.d("MSVC", "[handle] got line='$line'")
+        val ev = parseWireLineToEvent(line)
+        if (ev == null) {
+            Log.w("MSVC", "[handle] parse -> null  (업로드 스킵)")
+            return
+        }
+        Log.d("MSVC", "[handle] parsed event=${ev.event} ts=${ev.ts_ms}")
 
-        // UI용 스트림 (선택)
-        ev.smoothed_left?.lastOrNull()?.let { l ->
-            ev.smoothed_right?.lastOrNull()?.let { r ->
-                PpgRepository.emitSmoothed(l, r)
-            }
+        val uid = FirebaseAuth.getInstance().currentUser?.uid ?: run {
+            Log.e("MSVC", "[handle] no uid (업로드 스킵)")
+            return
         }
 
-        val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return
+        Log.d("MSVC", "[handle] call uploadRecord uid=$uid session=$sessionId")
         try {
-            repo.uploadRecord(uid, sessionId, ev)
+            val docId = repo.uploadRecord(uid, sessionId, ev)
+            Log.d("MSVC", "[handle] firestore OK: $docId")
         } catch (t: Throwable) {
-            Log.e("MeasureService", "uploadRecord failed", t)
+            Log.e("MSVC", "[handle] firestore fail", t)
         }
     }
 
-    private fun parseCsvLineToEvent(line: String): PpgEvent? {
+
+
+    // KV 라인 → PpgEvent
+    private fun parseWireLineToEvent(line: String): PpgEvent? {
         val raw = line.trim()
-        if (raw.isEmpty()) return null
-        if (raw.startsWith("#")) return null
-        if (raw.lowercase().startsWith("event,")) return null
+        if (raw.isEmpty() || raw.startsWith("#")) return null
 
-        val parts = raw.split(",").map { it.trim() }.toMutableList()
-        while (parts.size < 19) parts.add("")
-
-        val event       = parts[0].ifBlank { "STAT" }.uppercase()
-        val hostTimeIso = parts[1].ifBlank { utcIsoNow() }
-        val tsMs        = parts[2].toLongOrNull() ?: 0L
-        val alertType   = parts[3].ifBlank { null }
-        val reasons     = parseReasons(parts[4])
-
-        fun D(s: String) = s.removePrefix("[").removeSuffix("]").takeIf { it.isNotEmpty() }?.toDoubleOrNull()
-        fun I(s: String) = s.takeIf { it.isNotEmpty() }?.toIntOrNull()
-        fun listD(s: String): List<Double>? {
-            if (s.isBlank()) return null
-            val t = s.removePrefix("[").removeSuffix("]")
-            val toks = t.split(',', ';', '|').map { it.trim() }.filter { it.isNotEmpty() }
-            if (toks.isEmpty()) return null
-            val vals = toks.mapNotNull { it.toDoubleOrNull() }
-            return if (vals.isEmpty()) null else vals
+        // 첫 토큰은 STAT | ALERT
+        val sp = raw.split(Regex("\\s+"))
+        if (sp.isEmpty()) return null
+        val kind = sp[0].uppercase()
+        if (kind != "STAT" && kind != "ALERT") {
+            Log.w("PARSE", "unknown kind: ${sp[0]}")
+            return null
         }
-        fun sideNorm(s: String): String? {
-            val v = s.trim().lowercase()
-            return when (v) { "left", "right", "balance" -> v; else -> null }
+
+        // 나머지는 key=value 형태
+        val kv = mutableMapOf<String, String>()
+        for (i in 1 until sp.size) {
+            val token = sp[i]
+            val eq = token.indexOf('=')
+            if (eq <= 0) continue
+            kv[token.substring(0, eq)] = token.substring(eq+1)
         }
+
+        if (kv.isEmpty()) {
+            Log.w("PARSE", "no kv parsed: $raw")
+            return null
+        }
+
+        fun D(k: String) = kv[k]?.toDoubleOrNull()
+        fun L(k: String) = kv[k]?.toLongOrNull()
+        fun I(k: String) = kv[k]?.toIntOrNull()
+        fun sideNorm(s: String?): String? = when (s?.lowercase()) {
+            "left","right","balanced","balance","uncertain" -> s.lowercase()
+            else -> null
+        }
+        fun reasonsList(s: String?): List<String>? =
+            s?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }?.ifEmpty { null }
+
+        //val hostIso = OffsetDateTime.now(ZoneOffset.UTC).toString()
 
         return PpgEvent(
-            event = event,
-            host_time_iso = hostTimeIso,
-            ts_ms = tsMs,
-            alert_type = alertType,
-            reasons = reasons,
-            AmpRatio = D(parts[5]),
-            PAD_ms = D(parts[6]),
-            dSUT_ms = D(parts[7]),
-            ampL = D(parts[8]),
-            ampR = D(parts[9]),
-            SUTL_ms = D(parts[10]),
-            SUTR_ms = D(parts[11]),
-            BPM_L = D(parts[12]),
-            BPM_R = D(parts[13]),
-            PQIL = I(parts[14]),
-            PQIR = I(parts[15]),
-            side = sideNorm(parts[16]),
-            smoothed_left = listD(parts[17]),
-            smoothed_right = listD(parts[18])
+            event = kind,
+            host_time_iso = java.time.OffsetDateTime.now(java.time.ZoneOffset.UTC).toString(),
+            ts_ms = L("ts") ?: 0L,
+            alert_type = kv["type"],
+            reasons = reasonsList(kv["reasons"]),
+            AmpRatio = D("AmpRatio"),
+            PAD_ms = D("PAD"),
+            dSUT_ms = D("dSUT"),
+            ampL = D("ampL"),
+            ampR = D("ampR"),
+            SUTL_ms = D("SUTL"),
+            SUTR_ms = D("SUTR"),
+            BPM_L = D("BPM_L"),
+            BPM_R = D("BPM_R"),
+            PQIL = I("PQIL"),
+            PQIR = I("PQIR"),
+            side = sideNorm(kv["side"]),
+            // 이 스트림엔 smoothed_left/right 배열은 안 옴
+            smoothed_left = null,
+            smoothed_right = null
         )
     }
+
 
     private fun parseReasons(s: String?): List<String>? {
         if (s.isNullOrBlank()) return null
