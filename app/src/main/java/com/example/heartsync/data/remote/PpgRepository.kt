@@ -79,8 +79,21 @@ class PpgRepository(
         fun <T> num(key: String, conv: (String)->T): T? =
             Regex("""\b$key=([-\d.]+)""").find(line)?.groupValues?.getOrNull(1)?.let(conv)
 
+        // 여러 키 중 하나라도 있으면 우선 사용
+        fun numAny(vararg keys: String): Double? {
+            for (k in keys) {
+                val v = num(k) { it.toDouble() }
+                if (v != null) return v
+            }
+            return null
+        }
+
         val ts   = num("ts") { it.toLong() } ?: return null
         val side = Regex("""\bside=([A-Za-z_]+)""").find(line)?.groupValues?.getOrNull(1)
+
+        // ✅ 아두이노 전송 키 대응
+        val ppgfL = numAny("PPGf_L", "PPG_L", "PPG_left")
+        val ppgfR = numAny("PPGf_R", "PPG_R", "PPG_right")
 
         return PpgEvent(
             event = eventType,              // ★ STAT 또는 ALERT 로 들어감
@@ -108,8 +121,8 @@ class PpgRepository(
 
             side = side,
 
-            smoothed_left = null,
-            smoothed_right = null,
+            smoothed_left  = ppgfL,
+            smoothed_right = ppgfR,
         )
     }
 
@@ -166,6 +179,12 @@ class PpgRepository(
      * 세션 레코드 실시간 구독 (UI에서 바로 씀)
      * orderBy는 server_ts(서버시간) 기준, 최신 N개
      */
+    private fun readNumberFlexible(d: com.google.firebase.firestore.DocumentSnapshot, key: String): Double? {
+        d.getDouble(key)?.let { return it }                // 숫자로 저장된 경우
+        val arr = d.get(key) as? List<*>                  // 예전 문서: 배열 첫 원소
+        val first = arr?.firstOrNull() as? Number
+        return first?.toDouble()
+    }
     fun observeRecent(
         userId: String,
         sessionId: String,
@@ -205,8 +224,8 @@ class PpgRepository(
 
                         side = d.getString("side"),
 
-                        smoothed_left = (d.get("smoothed_left") as? List<*>)?.mapNotNull { (it as? Number)?.toDouble() },
-                        smoothed_right = (d.get("smoothed_right") as? List<*>)?.mapNotNull { (it as? Number)?.toDouble() },
+                        smoothed_left  = readNumberFlexible(d, "smoothed_left"),
+                        smoothed_right = readNumberFlexible(d, "smoothed_right"),
                     )
                 } catch (_: Exception) {
                     null

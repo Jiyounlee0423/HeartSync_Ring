@@ -30,6 +30,6 @@ data class PpgEvent(
 
     val side: String? = null,          // "left" | "right" | "balance"
 
-    val smoothed_left: List<Double>? = null,
-    val smoothed_right: List<Double>? = null
+    val smoothed_left: Double? = null,
+    val smoothed_right: Double? = null,
 )
