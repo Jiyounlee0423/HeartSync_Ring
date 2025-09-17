@@ -16,20 +16,22 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 import com.example.heartsync.data.model.GraphState
+import kotlin.math.max
 
 @Composable
 fun HomeGraphSection(
-    state: GraphState,
-    modifier: Modifier = Modifier   // ✅ 기본값은 항상 Modifier
+    left: List<Float>,
+    right: List<Float>,
+    modifier: Modifier = Modifier
 ) {
-    // 한쪽만 있어도 그리기
-    val hasData = state.smoothedL.isNotEmpty() || state.smoothedR.isNotEmpty()
+    val hasData = left.isNotEmpty() || right.isNotEmpty()
 
     val containerMod = modifier
         .fillMaxWidth()
@@ -37,28 +39,40 @@ fun HomeGraphSection(
         .padding(horizontal = 16.dp)
 
     if (!hasData) {
-        Box(
-            modifier = containerMod
-                .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(12.dp)),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                text = "데이터가 없습니다",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodyMedium
-            )
+        Box(containerMod, contentAlignment = Alignment.Center) {
+            Text("실시간 데이터를 기다리는 중…")
         }
         return
     }
 
-    DualLineGraph(
-        left = state.smoothedL,
-        right = state.smoothedR,
-        modifier = containerMod
-            .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(12.dp))
-            .padding(12.dp)
-    )
+    val all = left + right
+    val minY = all.minOrNull() ?: 0f
+    val maxY = all.maxOrNull() ?: 0f
+    val range = (maxY - minY).takeIf { it > 1e-6f } ?: 1f
+
+    Canvas(containerMod) {
+        val maxCount = max(left.size, right.size).coerceAtLeast(1)
+        val stepX = size.width / maxCount
+        fun mapY(v: Float) = size.height - ((v - minY) / range) * size.height
+
+        val pathL = Path()
+        left.forEachIndexed { i, v ->
+            val x = i * stepX
+            val y = mapY(v)
+            if (i == 0) pathL.moveTo(x, y) else pathL.lineTo(x, y)
+        }
+        drawPath(pathL, Color(0xFF3B82F6))
+
+        val pathR = Path()
+        right.forEachIndexed { i, v ->
+            val x = i * stepX
+            val y = mapY(v)
+            if (i == 0) pathR.moveTo(x, y) else pathR.lineTo(x, y)
+        }
+        drawPath(pathR, Color(0xFF10B981))
+    }
 }
+
 
 @Composable
 private fun DualLineGraph(
@@ -71,9 +85,14 @@ private fun DualLineGraph(
     val leftColor = MaterialTheme.colorScheme.primary
     val rightColor = MaterialTheme.colorScheme.tertiary
 
-    val all = remember(left, right) { left + right }
-    val minY = all.minOrNull() ?: 0f
-    val maxY = all.maxOrNull() ?: 1f
+    val (minY, maxY) = remember(left, right) {
+        var minV = Float.POSITIVE_INFINITY
+        var maxV = Float.NEGATIVE_INFINITY
+        for (v in left) { if (v < minV) minV = v; if (v > maxV) maxV = v }
+        for (v in right){ if (v < minV) minV = v; if (v > maxV) maxV = v }
+        if (minV == Float.POSITIVE_INFINITY) 0f to 1f else minV to maxV
+    }
+
     val yRange = if (maxY == minY) 1f else (maxY - minY)
     val n = maxOf(left.size, right.size).coerceAtLeast(2)
 

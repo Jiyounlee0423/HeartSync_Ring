@@ -4,6 +4,7 @@ package com.example.heartsync
 import android.Manifest
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions
@@ -39,6 +40,7 @@ import com.example.heartsync.viewmodel.BleViewModel
 import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.tasks.await
 import androidx.lifecycle.lifecycleScope
+import com.example.heartsync.data.remote.PpgRepository
 import com.google.firebase.FirebaseApp
 import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.launch
@@ -73,10 +75,24 @@ class MainActivity : ComponentActivity() {
             android.util.Log.d("HeartSyncInit",
                 "projectId=${app.options.projectId}, appId=${app.options.applicationId}")
 
-            val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return@launch
+            val uid = FirebaseAuth.getInstance().currentUser?.uid ?: run {
+                Log.w("Main", "No Firebase user yet")
+                return@launch
+            }
+
             val ref = FirebaseFirestore.getInstance()
                 .collection("users").document(uid)
                 .collection("health").document("ping")
+
+            val sessionId = com.example.heartsync.data.remote.PpgRepository
+                .instance
+                .getSessionId() ?: run {
+                android.util.Log.w("Main", "sessionId is null (MeasureService가 아직 설정 전)")
+                return@launch
+            }
+
+            // 4) Firestore 기반 그래프 수집 시작
+            bleVm.startFirestoreGraph(uid = uid, sessionId = sessionId, limit = 512L)
 
             runCatching {
                 ref.set(mapOf("ok" to true, "at" to System.currentTimeMillis())).await()

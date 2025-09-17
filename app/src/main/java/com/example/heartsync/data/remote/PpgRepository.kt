@@ -13,6 +13,9 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.tasks.await
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.DocumentChange
+import com.google.firebase.firestore.Query
+import kotlinx.coroutines.flow.Flow
 
 
 class PpgRepository(
@@ -27,7 +30,8 @@ class PpgRepository(
     }
 
     /** 필요시 현재 세션 조회 */
-    fun getSessionId(): String = sessionId
+    fun getSessionId(): String? = sessionId
+
 
     private fun col(userId: String, sessionId: String) =
         db.collection("ppg_events")
@@ -246,9 +250,11 @@ class PpgRepository(
         private const val MIN_INTERVAL_MS = 200L   // ≈ 5Hz. 필요에 맞게 100~500ms로 조정
 
         private val _smoothedFlow =
-            MutableSharedFlow<Pair<Double, Double>>(replay = 0, extraBufferCapacity = 128)
+            MutableSharedFlow<Pair<Float, Float>>(
+                replay = 1, extraBufferCapacity = 256
+            )
 
-        val smoothedFlow: SharedFlow<Pair<Double, Double>> = _smoothedFlow.asSharedFlow()
+        val smoothedFlow: SharedFlow<Pair<Float, Float>> = _smoothedFlow
 
         // 싱글톤 인스턴스
         val instance: PpgRepository by lazy { PpgRepository(FirebaseFirestore.getInstance()) }
@@ -258,8 +264,46 @@ class PpgRepository(
          * Number를 받도록 해서 Float/Double 둘 다 허용
          */
         fun emitSmoothed(left: Number, right: Number) {
-            _smoothedFlow.tryEmit(left.toDouble() to right.toDouble())
+            _smoothedFlow.tryEmit(left.toFloat() to right.toFloat())
         }
+
     }
 
+    fun pushSmoothed(l: Float, r: Float) {
+        _smoothedFlow.tryEmit(l to r)
+    }
+
+
+    // PpgRepository.kt
+    fun observeSmoothedFromFirestore(
+        uid: String,
+        sessionId: String,
+        limit: Long = 512L
+    ): Flow<Pair<Float, Float>> = callbackFlow {
+        val ref = FirebaseFirestore.getInstance()
+            .collection("ppg_events")
+            .document(uid)
+            .collection("sessions")
+            .document(sessionId)
+            .collection("records")
+            .orderBy("ts_ms", Query.Direction.DESCENDING)
+            .limit(limit)
+
+        val reg = ref.addSnapshotListener { snap, err ->
+            if (err != null) { close(err); return@addSnapshotListener }
+            if (snap == null) return@addSnapshotListener
+
+            // 최신 → 오래된 순으로 오니 시간순으로 뒤집어서 보냄
+            for (d in snap.documents.asReversed()) {
+                // 숫자/문자 혼합 저장 대비
+                fun num(key: String): Double? =
+                    d.getDouble(key) ?: (d.get(key) as? Number)?.toDouble()
+
+                val l = num("smoothed_left")
+                val r = num("smoothed_right")
+                if (l != null && r != null) trySend(l.toFloat() to r.toFloat())
+            }
+        }
+        awaitClose { reg.remove() }
+    }
 }

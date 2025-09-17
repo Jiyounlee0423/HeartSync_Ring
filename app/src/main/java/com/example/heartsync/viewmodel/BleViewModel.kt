@@ -3,6 +3,7 @@ package com.example.heartsync.viewmodel
 
 import android.app.Application
 import android.content.Intent
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.heartsync.ble.PpgBleClient
@@ -15,12 +16,19 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.launch
 
-class BleViewModel(app: Application) : AndroidViewModel(app) {
+class BleViewModel(
+    app: Application
+) : AndroidViewModel(app) {
 
     private val client = PpgBleClient(app)
+
+    private val _graphState = MutableStateFlow(GraphState())
+    val graphState: StateFlow<GraphState> = _graphState
 
     private val _scanning = MutableStateFlow(false)
     val scanning: StateFlow<Boolean> = _scanning.asStateFlow()
@@ -35,23 +43,46 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
     private var scanJob: Job? = null
     private var connJob: Job? = null
 
-    private val MAX_GRAPH_POINTS = 600
-
-    private val _graphState = MutableStateFlow(GraphState())
-    val graphState: StateFlow<GraphState> = _graphState.asStateFlow()
+    private val MAX_GRAPH_POINTS = 512
 
     init {
-        // PpgRepository의 실시간 스무딩 샘플 수집 → 최근 N포인트 버퍼 유지
-        PpgRepository.smoothedFlow
+        PpgRepository.smoothedFlow            // ★ companion 쪽 Flow
             .onEach { (l, r) ->
-                _graphState.update { prev ->
-                    val newL = (prev.smoothedL + l.toFloat()).takeLast(MAX_GRAPH_POINTS)
-                    val newR = (prev.smoothedR + r.toFloat()).takeLast(MAX_GRAPH_POINTS)
-                    prev.copy(smoothedL = newL, smoothedR = newR)
+                android.util.Log.d("BleVM", "flow L=$l R=$r")
+                _graphState.update { p ->
+                    p.copy(
+                        smoothedL = (p.smoothedL + l).takeLast(MAX_GRAPH_POINTS),
+                        smoothedR = (p.smoothedR + r).takeLast(MAX_GRAPH_POINTS)
+                    )
                 }
             }
             .launchIn(viewModelScope)
     }
+
+    /**
+     * 2) Firestore에서 최근 N개를 그래프로 받고 싶을 때 Activity/Fragment에서
+     *    uid, sessionId가 준비된 시점에 한 번 호출해줘.
+     */
+    fun startFirestoreGraph(uid: String, sessionId: String, limit: Long = 512L) {
+        viewModelScope.launch {
+            PpgRepository.instance
+                .observeSmoothedFromFirestore(uid, sessionId, limit)
+                .onEach { (l, r) ->
+                    val cap = limit.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                    _graphState.update { prev ->
+                        prev.copy(
+                            smoothedL = (prev.smoothedL + l).takeLast(cap),
+                            smoothedR = (prev.smoothedR + r).takeLast(cap)
+                        )
+                    }
+                }
+                .catch { e -> android.util.Log.e("BleVM", "observe error", e) }
+                .collect{}
+        }
+    }
+
+
+
 
     fun startScan() {
         if (_scanning.value) return
@@ -76,7 +107,6 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
     fun connect(device: BleDevice) {
         // 스캔 중이면 중지
         stopScan()
-
         // 연결 요청
         client.connect(device)
 

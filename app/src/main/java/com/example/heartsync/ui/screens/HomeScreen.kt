@@ -7,6 +7,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.heartsync.ble.PpgBleClient
 import com.example.heartsync.viewmodel.BleViewModel
 import com.example.heartsync.ui.components.StatusCard
@@ -21,13 +22,14 @@ fun HomeScreen(
     onStartMeasure: () -> Unit
 ) {
     val conn by bleVm.connectionState.collectAsState()
-    val graph by bleVm.graphState.collectAsState()   // ★ 추가: 그래프 상태 수집
+
 
     val isConnected = conn is PpgBleClient.ConnectionState.Connected
     val deviceName = (conn as? PpgBleClient.ConnectionState.Connected)?.device?.name ?: "Unknown"
+    val graphState by bleVm.graphState.collectAsStateWithLifecycle()
 
     Column(
-        Modifier
+        modifier = Modifier
             .fillMaxSize()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -55,7 +57,16 @@ fun HomeScreen(
         // ★ 여기서부터 실제 그래프
         // 데이터가 없으면 HomeGraphSection이 "데이터가 없습니다"를 표시하고,
         // 있으면 smoothed_L/R 라인만 그립니다.
-        HomeGraphSection(state = graph)
+        // 그래프 섹션
+        HomeGraphSection(
+            left = graphState.smoothedL,
+            right = graphState.smoothedR,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(180.dp)
+        )
+        Text("L=${graphState.smoothedL.size}  R=${graphState.smoothedR.size}")
+
 
         Button(
             onClick = onStartMeasure,

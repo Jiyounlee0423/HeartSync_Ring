@@ -45,6 +45,15 @@ class MeasureService : Service() {
     private var userId: String = ""
     private var sessionId: String = ""
 
+    // --- 그래프용 EMA 상태 (서비스 멤버) ---
+    private var emaL: Double? = null
+    private var emaR: Double? = null
+    private val EMA_ALPHA = 0.2  // 0.1~0.3 사이에서 조절
+
+    private fun emaUpdate(prev: Double?, x: Double): Double =
+        if (prev == null) x else EMA_ALPHA * x + (1 - EMA_ALPHA) * prev
+
+
     override fun onCreate() {
         super.onCreate()
         val sid = "S_" + java.text.SimpleDateFormat(
@@ -92,6 +101,30 @@ class MeasureService : Service() {
         MeasureStatusBus.setMeasuring(true)
     }
 
+//    private fun parseSmoothed(line: String): Pair<Float, Float>? {
+//        fun num(key: String): Float? =
+//            Regex("""\b${key}=([-\d.]+)""").find(line)?.groupValues?.getOrNull(1)?.toFloatOrNull()
+//
+//        val l = num("PPGf_L") ?: num("smoothedL")
+//        val r = num("PPGf_R") ?: num("smoothedR")
+//        return if (l != null && r != null) l to r else null
+//    }
+
+    // (A) 라인 파서 교체/추가
+    private fun parseSmoothed(line: String): Pair<Float, Float>? {
+        fun pick(key: String): Float? =
+            Regex("""\b${key}=([-\d.]+)""").find(line)
+                ?.groupValues?.getOrNull(1)
+                ?.toFloatOrNull()
+
+        // 1순위: PPGf_L/PPGf_R  |  2순위(혹시 있을 때): smoothedL/smoothedR
+        val l = pick("PPGf_L") ?: pick("smoothedL")
+        val r = pick("PPGf_R") ?: pick("smoothedR")
+        return if (l != null && r != null) l to r else null
+    }
+
+
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val devName = intent?.getStringExtra(EXTRA_DEVICE_NAME)
         val devAddr = intent?.getStringExtra(EXTRA_DEVICE_ADDR)
@@ -104,7 +137,12 @@ class MeasureService : Service() {
         client = PpgBleClient(
             ctx = this,
             onLine = { line ->
-                scope.launch(Dispatchers.IO) { handleLine(line) }
+                scope.launch(Dispatchers.IO) {
+                    handleLine(line)
+                    parseSmoothed(line)?.let { (l, r) ->
+                        PpgRepository.instance.pushSmoothed(l, r)
+                    }
+                }
             },
             onError = { e ->
                 Log.e("MeasureService", "BLE error: $e")
@@ -172,6 +210,21 @@ class MeasureService : Service() {
             return
         }
         Log.d("MSVC", "[handle] parsed event=${ev.event} ts=${ev.ts_ms}")
+
+        // --- (A) 그래프용 값 추출 → EMA 스무딩 → Repo emit ---
+        val lSrc: Double? = ev.ampL ?: ev.BPM_L   // 왼쪽 채널 원천값
+        val rSrc: Double? = ev.ampR ?: ev.BPM_R   // 오른쪽 채널 원천값
+
+        if (lSrc != null && rSrc != null) {
+            emaL = emaUpdate(emaL, lSrc)
+            emaR = emaUpdate(emaR, rSrc)
+            val outL = emaL!!
+            val outR = emaR!!
+            Log.d("MSVC", "graph emit L=$outL R=$outR (src ampL=$lSrc ampR=$rSrc)")
+            PpgRepository.instance.pushSmoothed(outL.toFloat(), outR.toFloat())   // ★ 여기서 홈 그래프 파이프라인으로 보냄
+        } else {
+            Log.w("MSVC", "no L/R source (ampL/ampR/BPM_L/BPM_R 없음)")
+        }
 
         val uid = FirebaseAuth.getInstance().currentUser?.uid ?: run {
             Log.e("MSVC", "[handle] no uid (업로드 스킵)")
