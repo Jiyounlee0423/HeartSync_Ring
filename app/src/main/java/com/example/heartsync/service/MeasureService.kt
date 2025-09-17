@@ -21,6 +21,11 @@ import kotlinx.coroutines.launch
 import java.time.OffsetDateTime
 import java.time.ZoneOffset
 import java.util.UUID
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.Date
+
+
 
 class MeasureService : Service() {
 
@@ -42,6 +47,17 @@ class MeasureService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        val sid = "S_" + java.text.SimpleDateFormat(
+            "yyyyMMdd_HHmmss", java.util.Locale.US
+        ).format(java.util.Date())
+        PpgRepository.instance.setSessionId(sid)   // ★ 인스턴스로 호출
+
+        val auth = FirebaseAuth.getInstance()
+        if (auth.currentUser == null) {
+            auth.signInAnonymously()
+                .addOnSuccessListener { Log.d("MeasureService", "Anon sign-in in service") }
+                .addOnFailureListener { Log.e("MeasureService", "Anon sign-in failed", it) }
+        }
 
         val app = com.google.firebase.FirebaseApp.getInstance()
         val opt = app.options

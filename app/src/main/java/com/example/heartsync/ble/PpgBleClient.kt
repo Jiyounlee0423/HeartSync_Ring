@@ -15,6 +15,9 @@ import com.example.heartsync.data.model.BleDevice
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 
@@ -34,6 +37,8 @@ class PpgBleClient(
         UUID.fromString("5dde726d-4cf3-4e2f-ab24-323caa359b78")
     )
     private val cccdUuid: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+    private val repoScope = CoroutineScope(Dispatchers.IO)
 
     // ===== UI State =====
     sealed interface ConnectionState {
@@ -65,16 +70,61 @@ class PpgBleClient(
 
     // 라인 프레이머 (Notify 조각 → \n 단위 줄)
     private val lineBuf = StringBuilder()
+    private fun StringBuilder.indexOfAny(chars: CharArray): Int {
+        for (i in 0 until this.length) {
+            val c = this[i]
+            for (t in chars) if (c == t) return i
+        }
+        return -1
+    }
+
     private fun feedBytesAndEmitLines(bytes: ByteArray) {
+        // 임시 디버그: 바이트 덤프 찍어 구분자 확인 (필요 없으면 지워도 됨)
+        // Log.d("BLE", "chunk hex=" + bytes.joinToString(" ") { "%02X".format(it) })
+
         val s = try { bytes.toString(Charsets.UTF_8) } catch (_: Exception) { return }
         lineBuf.append(s)
+
+        // ★ CR('\r') 또는 LF('\n') 아무거나 오면 줄로 간주
+        val delims = charArrayOf('\n', '\r')
         while (true) {
-            val idx = lineBuf.indexOf("\n")
+            val idx = lineBuf.indexOfAny(delims)
             if (idx < 0) break
-            val line = lineBuf.substring(0, idx).trimEnd('\r')
+
+            val line = lineBuf.substring(0, idx).trim()  // 앞뒤 공백/CR/LF 제거
             lineBuf.delete(0, idx + 1)
-            if (line.isNotBlank()) {
+
+            if (line.isNotEmpty()) {
                 Log.d("BLE", "feed line -> $line")
+
+                // STAT 라인은 Firestore 저장 시도
+                if (line.startsWith("STAT") || line.startsWith("ALERT")) {
+                    repoScope.launch {
+                        com.example.heartsync.data.remote.PpgRepository
+                            .instance
+                            .trySaveFromLine(line)   // ★ 바뀐 함수명
+                    }
+                }
+
+                // UI로 전달
+                onLine(line)
+            }
+        }
+
+        // ★ 방어: 개행이 전혀 안 오는 상황에서 버퍼 과도 증가 방지
+        if (lineBuf.length > 8192) {
+            Log.w("BLE", "lineBuf overflow (${lineBuf.length}), flushing as one line")
+            val line = lineBuf.toString().trim()
+            lineBuf.clear()
+            if (line.isNotEmpty()) {
+                Log.d("BLE", "feed line -> $line")
+                if (line.startsWith("STAT") || line.startsWith("ALERT")) {
+                    repoScope.launch {
+                        com.example.heartsync.data.remote.PpgRepository
+                            .instance
+                            .trySaveFromLine(line)   // ★ 바뀐 함수명
+                    }
+                }
                 onLine(line)
             }
         }

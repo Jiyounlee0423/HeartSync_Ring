@@ -37,6 +37,11 @@ import com.example.heartsync.util.Route
 import com.example.heartsync.viewmodel.AuthViewModel
 import com.example.heartsync.viewmodel.BleViewModel
 import com.google.firebase.auth.FirebaseAuth
+import kotlinx.coroutines.tasks.await
+import androidx.lifecycle.lifecycleScope
+import com.google.firebase.FirebaseApp
+import com.google.firebase.firestore.FirebaseFirestore
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -48,7 +53,39 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestRuntimePerms()
+
+        lifecycleScope.launch {
+            val auth = FirebaseAuth.getInstance()
+            if (auth.currentUser == null) {
+                runCatching { auth.signInAnonymously().await() }
+                    .onSuccess {
+                        android.util.Log.d("Auth", "Anonymous sign-in OK: uid=${auth.currentUser?.uid}")
+                    }
+                    .onFailure { e ->
+                        android.util.Log.e("Auth", "Anonymous sign-in FAILED", e)
+                        return@launch
+                    }
+            } else {
+                android.util.Log.d("Auth", "Already signed in: uid=${auth.currentUser?.uid}")
+            }
+
+            val app = FirebaseApp.getInstance()
+            android.util.Log.d("HeartSyncInit",
+                "projectId=${app.options.projectId}, appId=${app.options.applicationId}")
+
+            val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return@launch
+            val ref = FirebaseFirestore.getInstance()
+                .collection("users").document(uid)
+                .collection("health").document("ping")
+
+            runCatching {
+                ref.set(mapOf("ok" to true, "at" to System.currentTimeMillis())).await()
+            }.onSuccess {
+                android.util.Log.d("Firestore", "TEST WRITE OK")
+            }.onFailure { t ->
+                android.util.Log.e("Firestore", "TEST WRITE FAIL", t)
+            }
+        }
 
         setContent {
             HeartSyncTheme {

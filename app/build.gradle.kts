@@ -89,4 +89,18 @@ dependencies {
 
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 
+    // (이미 있을 수도 있음) 코루틴 기본
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+    // ★ 중요: Firebase Task를 코루틴 await()로 바꿔주는 확장 모듈
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
+
+    // (권장) lifecycleScope 쓰면 필요
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+
+    // (이미 있을 가능성 큼) Firebase
+    implementation(platform("com.google.firebase:firebase-bom:33.3.0"))
+    implementation("com.google.firebase:firebase-auth-ktx")
+    implementation("com.google.firebase:firebase-firestore-ktx")
+
 }

@@ -12,10 +12,22 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.tasks.await
+import com.google.firebase.auth.FirebaseAuth
+
 
 class PpgRepository(
     private val db: FirebaseFirestore
 ) {
+    @Volatile private var sessionId: String = ""
+
+    /** MeasureService 등에서 1회 세션ID 세팅 */
+    fun setSessionId(id: String) {
+        sessionId = id
+        Log.d("PpgRepo", "sessionId set -> $sessionId")
+    }
+
+    /** 필요시 현재 세션 조회 */
+    fun getSessionId(): String = sessionId
 
     private fun col(userId: String, sessionId: String) =
         db.collection("ppg_events")
@@ -23,6 +35,83 @@ class PpgRepository(
             .collection("sessions")
             .document(sessionId)
             .collection("records")
+
+    // 클래스 멤버에 추가 (쓰로틀 상태)
+    @Volatile private var lastWriteMs: Long = 0L
+
+    /** STAT/ALERT 라인 공통 처리 */
+    suspend fun trySaveFromLine(line: String) {
+        // 1) 이벤트 타입 추출 (맨 앞 토큰)
+        val eventType = line.substringBefore(' ').trim()
+        if (eventType != "STAT" && eventType != "ALERT") return
+
+        Log.d("PpgRepo", "trySaveFromLine IN: ${eventType} ${line.take(100)}")
+
+        // 2) 파싱
+        val ev = parseStatLikeLine(line, eventType) ?: run {
+            Log.w("PpgRepo", "parse fail ($eventType)")
+            return
+        }
+
+        // 3) uid/세션 확보
+        val uid = FirebaseAuth.getInstance().currentUser?.uid ?: run {
+            Log.e("PpgRepo", "uid null -> skip")
+            return
+        }
+        val sid = if (sessionId.isNotBlank()) sessionId
+        else "S_${System.currentTimeMillis()}".also {
+            sessionId = it
+            Log.d("PpgRepo", "sessionId (auto) -> $sessionId")
+        }
+
+        // 4) 쓰로틀: ALERT는 즉시 저장, STAT는 최소 간격 유지
+        val now = System.currentTimeMillis()
+        val shouldWrite = (eventType == "ALERT") || (now - lastWriteMs >= MIN_INTERVAL_MS)
+        if (!shouldWrite) return
+        lastWriteMs = now
+
+        Log.d("PpgRepo", "upload start: $eventType uid=$uid sid=$sid ts=${ev.ts_ms}")
+        uploadRecord(uid, sid, ev)
+    }
+
+    /** STAT/ALERT 공통 포맷 파싱 */
+    private fun parseStatLikeLine(line: String, eventType: String): PpgEvent? {
+        fun <T> num(key: String, conv: (String)->T): T? =
+            Regex("""\b$key=([-\d.]+)""").find(line)?.groupValues?.getOrNull(1)?.let(conv)
+
+        val ts   = num("ts") { it.toLong() } ?: return null
+        val side = Regex("""\bside=([A-Za-z_]+)""").find(line)?.groupValues?.getOrNull(1)
+
+        return PpgEvent(
+            event = eventType,              // ★ STAT 또는 ALERT 로 들어감
+            host_time_iso = "",             // 필요시 ISO 시간 넣어도 됨
+            ts_ms = ts,
+
+            alert_type = if (eventType == "ALERT") "device" else null, // 필요시 조정
+            reasons = null,
+
+            AmpRatio = num("AmpRatio"){ it.toDouble() },
+            PAD_ms   = num("PAD"){ it.toDouble() },
+            dSUT_ms  = num("dSUT"){ it.toDouble() },
+
+            ampL = num("ampL"){ it.toDouble() },
+            ampR = num("ampR"){ it.toDouble() },
+
+            SUTL_ms = num("SUTL"){ it.toDouble() },
+            SUTR_ms = num("SUTR"){ it.toDouble() },
+
+            BPM_L = num("BPM_L"){ it.toDouble() },
+            BPM_R = num("BPM_R"){ it.toDouble() },
+
+            PQIL = num("PQIL"){ it.toDouble() }?.toInt(),
+            PQIR = num("PQIR"){ it.toDouble() }?.toInt(),
+
+            side = side,
+
+            smoothed_left = null,
+            smoothed_right = null,
+        )
+    }
 
     suspend fun uploadRecord(userId: String, sessionId: String, ev: PpgEvent): String {
 
@@ -135,10 +224,15 @@ class PpgRepository(
          * - UI: PpgRepository.smoothedFlow.collect { (l, r) -> ... }
          * - Service/BLE: PpgRepository.emitSmoothed(l, r)
          */
+        private const val MIN_INTERVAL_MS = 200L   // ≈ 5Hz. 필요에 맞게 100~500ms로 조정
+
         private val _smoothedFlow =
             MutableSharedFlow<Pair<Double, Double>>(replay = 0, extraBufferCapacity = 128)
 
         val smoothedFlow: SharedFlow<Pair<Double, Double>> = _smoothedFlow.asSharedFlow()
+
+        // 싱글톤 인스턴스
+        val instance: PpgRepository by lazy { PpgRepository(FirebaseFirestore.getInstance()) }
 
         /**
          * 생산자(서비스/블루투스)에서 호출: 스무딩된 좌/우 값을 방출
