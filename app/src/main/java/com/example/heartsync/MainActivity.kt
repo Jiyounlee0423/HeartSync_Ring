@@ -240,7 +240,9 @@ class MainActivity : ComponentActivity() {
                 }
 
                 composable(Route.Docs) {
-                    RequireAuth(navController) { DataVizScreen() }
+                    RequireAuth(navController) {
+                        DataVizScreen(deviceId = "fpb8XE0z2ifrQJGV4liKw31grQR2")
+                    }
                 }
 
                 composable(Route.Noti) {
