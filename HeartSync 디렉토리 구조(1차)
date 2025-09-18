@@ -28,11 +28,14 @@ app/
  │   │   │   │   ├─ PasswordField.kt
  │   │   │   │   ├─ StatusCard.kt
  │   │   │   │   ├─ TopBar.kt
+ │   │   │   ├─ home/
+ │   │   │   │   ├─ HomeVmFactory.kt
  │   │   │   ├─ screens/
  │   │   │   │   ├─ BleConnectScreen.kt
  │   │   │   │   ├─ DataVizScreen.kt
  │   │   │   │   ├─ HomeScreen.kt
  │   │   │   │   ├─ LoginScreen.kt
+ │   │   │   │   ├─ MeasureScreen.kt
  │   │   │   │   ├─ NotiLogScreen.kt
  │   │   │   │   ├─ RegisterScreen.kt
  │   │   │   │   ├─ SplashScreen.kt
@@ -49,6 +52,8 @@ app/
  │   │   └─ viewmodel/
  │   │       └─ AuthViewModel.kt
  │   │       └─ BleViewModel.kt
+ │   │       └─ DataBizViewModel.kt
+ │   │       └─ HomeViewModel.kt
  │   │       └─ PpgViewModel.kt
  │   │       └─ ProfileViewModel.kt
 
