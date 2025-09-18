@@ -1,9 +1,7 @@
-// app/src/main/java/com/example/heartsync/viewmodel/BleViewModel.kt
 package com.example.heartsync.viewmodel
 
 import android.app.Application
 import android.content.Intent
-import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.heartsync.ble.PpgBleClient
@@ -11,14 +9,8 @@ import com.example.heartsync.data.model.BleDevice
 import com.example.heartsync.data.model.GraphState
 import com.example.heartsync.data.remote.PpgRepository
 import com.example.heartsync.service.MeasureService
-import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
 class BleViewModel(
@@ -40,15 +32,19 @@ class BleViewModel(
         MutableStateFlow<PpgBleClient.ConnectionState>(PpgBleClient.ConnectionState.Disconnected)
     val connectionState: StateFlow<PpgBleClient.ConnectionState> = _connectionState.asStateFlow()
 
+    /** 팝업용 ALERT 스트림 (Repo가 event=ALERT & side=left/right만 방출) */
+    val alerts: SharedFlow<PpgRepository.UiAlert> = PpgRepository.instance.alerts
+
     private var scanJob: Job? = null
     private var connJob: Job? = null
+    private var fsJob: Job? = null
 
     private val MAX_GRAPH_POINTS = 512
 
     init {
-        PpgRepository.smoothedFlow            // ★ companion 쪽 Flow
+        // BLE/서비스에서 바로 쏘는 실시간 smoothed 값 반영
+        PpgRepository.smoothedFlow
             .onEach { (l, r) ->
-                android.util.Log.d("BleVM", "flow L=$l R=$r")
                 _graphState.update { p ->
                     p.copy(
                         smoothedL = (p.smoothedL + l).takeLast(MAX_GRAPH_POINTS),
@@ -59,12 +55,11 @@ class BleViewModel(
             .launchIn(viewModelScope)
     }
 
-    /**
-     * 2) Firestore에서 최근 N개를 그래프로 받고 싶을 때 Activity/Fragment에서
-     *    uid, sessionId가 준비된 시점에 한 번 호출해줘.
-     */
+    /** Firestore에서 smoothed만 따라 읽어 그래프에 반영 (프록시) */
     fun startFirestoreGraph(uid: String, sessionId: String, limit: Long = 512L) {
-        viewModelScope.launch {
+        // 기존 구독이 있다면 갱신
+        fsJob?.cancel()
+        fsJob = viewModelScope.launch {
             PpgRepository.instance
                 .observeSmoothedFromFirestore(uid, sessionId, limit)
                 .onEach { (l, r) ->
@@ -76,22 +71,16 @@ class BleViewModel(
                         )
                     }
                 }
-                .catch { e -> android.util.Log.e("BleVM", "observe error", e) }
-                .collect{}
+                .catch { e -> android.util.Log.e("BleVM", "observeSmoothedFromFirestore error", e) }
+                .collect()
         }
     }
-
-
-
 
     fun startScan() {
         if (_scanning.value) return
         _scanning.value = true
-
-        // 실제 스캔 시작
         client.startScan()
 
-        // 기존 수집 중지 후 재시작
         scanJob?.cancel()
         scanJob = client.scanResults
             .onEach { list -> _scanResults.value = list }
@@ -105,12 +94,9 @@ class BleViewModel(
     }
 
     fun connect(device: BleDevice) {
-        // 스캔 중이면 중지
         stopScan()
-        // 연결 요청
         client.connect(device)
 
-        // 연결 상태 수집 (중복 수집 방지)
         connJob?.cancel()
         connJob = client.connectionState
             .onEach { state -> _connectionState.value = state }
@@ -120,9 +106,10 @@ class BleViewModel(
     fun disconnect() {
         client.disconnect()
         _connectionState.value = PpgBleClient.ConnectionState.Disconnected
-        // 필요시 수집 중지도 함께
         connJob?.cancel()
         clearGraph()
+        // Firestore 구독도 정리(필요 시)
+        fsJob?.cancel()
     }
 
     fun clearGraph() {
@@ -133,18 +120,18 @@ class BleViewModel(
         super.onCleared()
         scanJob?.cancel()
         connJob?.cancel()
+        fsJob?.cancel()
         client.stopScan()
         client.disconnect()
     }
 
-    /** 연결된 기기로 측정(MeasureService) 시작 */
+    /** 연결된 기기로 측정 시작 */
     fun startMeasure(device: BleDevice) {
         val ctx = getApplication<Application>()
         val it = Intent(ctx, MeasureService::class.java).apply {
             putExtra(MeasureService.EXTRA_DEVICE_NAME, device.name)
             putExtra(MeasureService.EXTRA_DEVICE_ADDR, device.address)
         }
-        // API 26+ 대응
         if (android.os.Build.VERSION.SDK_INT >= 26) {
             ctx.startForegroundService(it)
         } else {
