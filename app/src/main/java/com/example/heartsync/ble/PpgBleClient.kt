@@ -20,6 +20,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
+import com.example.heartsync.data.remote.PpgRepository
+import java.nio.charset.StandardCharsets
 
 /**
  * HeartSync BLE 클라이언트
@@ -68,7 +70,8 @@ class PpgBleClient(
     private val descriptorQueue = LinkedBlockingQueue<BluetoothGattDescriptor>()
     private var scanCallback: ScanCallback? = null
 
-    // 라인 프레이머 (Notify 조각 → \n 단위 줄)
+
+    // 라인 프레이머 (Notify 조각 -> 개행 단위)
     private val lineBuf = StringBuilder()
     private fun StringBuilder.indexOfAny(chars: CharArray): Int {
         for (i in 0 until this.length) {
@@ -78,58 +81,72 @@ class PpgBleClient(
         return -1
     }
 
-    private fun feedBytesAndEmitLines(bytes: ByteArray) {
-        // 임시 디버그: 바이트 덤프 찍어 구분자 확인 (필요 없으면 지워도 됨)
-        // Log.d("BLE", "chunk hex=" + bytes.joinToString(" ") { "%02X".format(it) })
+    // 정규식 없이 key=value 숫자 파싱 (음수/소수 지원)
+    private fun parseNumKV(src: String, key: String): Double? {
+        val k = "$key="
+        val start = src.indexOf(k)
+        if (start < 0) return null
+        var i = start + k.length
+        if (i >= src.length) return null
+        val sb = StringBuilder()
+        while (i < src.length) {
+            val ch = src[i]
+            if (ch == '-' || ch == '.' || (ch in '0'..'9')) {
+                sb.append(ch)
+                i++
+            } else break
+        }
+        return sb.toString().toDoubleOrNull()
+    }
 
-        val s = try { bytes.toString(Charsets.UTF_8) } catch (_: Exception) { return }
+    private fun feedBytesAndEmitLines(bytes: ByteArray) {
+        // ★ String 생성자 모호성 회피: java.nio.charset.StandardCharsets 사용
+        val s = try { String(bytes, StandardCharsets.UTF_8) } catch (_: Exception) { return }
         lineBuf.append(s)
 
-        // ★ CR('\r') 또는 LF('\n') 아무거나 오면 줄로 간주
         val delims = charArrayOf('\n', '\r')
+
         while (true) {
             val idx = lineBuf.indexOfAny(delims)
             if (idx < 0) break
 
-            val line = lineBuf.substring(0, idx).trim()  // 앞뒤 공백/CR/LF 제거
+            val oneLine = lineBuf.substring(0, idx).trim()
             lineBuf.delete(0, idx + 1)
+            if (oneLine.isEmpty()) continue
 
-            if (line.isNotEmpty()) {
-                Log.d("BLE", "feed line -> $line")
-
-                // STAT 라인은 Firestore 저장 시도
-                if (line.startsWith("STAT") || line.startsWith("ALERT")) {
-                    repoScope.launch {
-                        // 둘 중 하나로 통일
-                        com.example.heartsync.data.remote.PpgRepository.trySaveFromLine(line)
-                        // 또는
-                        // com.example.heartsync.data.remote.PpgRepository.instance.trySaveFromLine(line)
-                    }
-                }
-
-                // UI로 전달
-                onLine(line)
+            // ★ 즉시 그래프 반영 (Firestore 저장과 독립)
+            val l = parseNumKV(oneLine, "PPGf_L") ?: parseNumKV(oneLine, "PPG_L")
+            val r = parseNumKV(oneLine, "PPGf_R") ?: parseNumKV(oneLine, "PPG_R")
+            if (l != null && r != null) {
+                PpgRepository.emitSmoothed(l, r)
             }
+
+            // 기록용 저장 (IO 스코프에서)
+            if (oneLine.startsWith("STAT") || oneLine.startsWith("ALERT")) {
+                repoScope.launch {
+                    com.example.heartsync.data.remote.PpgRepository.trySaveFromLine(oneLine)
+                }
+            }
+
+            // UI 로그 전달
+            onLine(oneLine)
         }
 
-        // ★ 방어: 개행이 전혀 안 오는 상황에서 버퍼 과도 증가 방지
+        // 개행이 전혀 안 오면 버퍼 과증식 방지
         if (lineBuf.length > 8192) {
-            Log.w("BLE", "lineBuf overflow (${lineBuf.length}), flushing as one line")
-            val line = lineBuf.toString().trim()
+            val oneLine = lineBuf.toString().trim()
             lineBuf.clear()
-            if (line.isNotEmpty()) {
-                Log.d("BLE", "feed line -> $line")
-                if (line.startsWith("STAT") || line.startsWith("ALERT")) {
-                    repoScope.launch {
-                        com.example.heartsync.data.remote.PpgRepository
-                            .instance
-                            .trySaveFromLine(line)   // ★ 바뀐 함수명
-                    }
-                }
-                onLine(line)
+            if (oneLine.isNotEmpty()) {
+                val l = parseNumKV(oneLine, "PPGf_L") ?: parseNumKV(oneLine, "PPG_L")
+                val r = parseNumKV(oneLine, "PPGf_R") ?: parseNumKV(oneLine, "PPG_R")
+                if (l != null && r != null) PpgRepository.emitSmoothed(l, r)
+                repoScope.launch { PpgRepository.instance.trySaveFromLinePublic(oneLine) }
+                onLine(oneLine)
             }
         }
     }
+
+
 
     // 재시도용
     private var targetDevice: BleDevice? = null

@@ -11,6 +11,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -25,14 +26,13 @@ import com.example.heartsync.data.remote.PpgPoint
 import com.example.heartsync.data.remote.PpgRepository
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.time.LocalDate
 import java.util.*
-import kotlin.math.roundToInt
+
+/* --------------------------- Screen --------------------------- */
 
 @Composable
 fun HomeScreen(
@@ -46,27 +46,31 @@ fun HomeScreen(
     val scroll = rememberScrollState()
 
     val conn by bleVm.connectionState.collectAsState()
-    val graphState by bleVm.graphState.collectAsStateWithLifecycle()
-
     val isConnected = conn is PpgBleClient.ConnectionState.Connected
     val deviceName = (conn as? PpgBleClient.ConnectionState.Connected)?.device?.name ?: "Unknown"
 
-    val points by vm.today.collectAsState()
-    val isLoggedIn by vm.isLoggedIn.collectAsState()
+    // ★ 연결 상태가 바뀔 때마다 VM에 알려서 live 버퍼를 정리
+    LaunchedEffect(isConnected) {
+        vm.onBleConnectionChanged(isConnected)
+    }
 
-    var window by rememberSaveable { mutableStateOf(600) }
+    val isLoggedIn by vm.isLoggedIn.collectAsState()
+    val live by vm.live.collectAsState()                          // 실시간 버퍼
+    val pointsDisplay by vm.display.collectAsState()              // 화면에 실제 뿌릴 데이터
+
+    var window by rememberSaveable { mutableStateOf(150) }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp)
-            .verticalScroll(scroll),              // ✅ 스크롤 가능
+            .verticalScroll(scroll),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         // 날짜 칩
         DateChip()
 
-        // 상태 배너
+        // 상태 배너(컴팩트)
         StatusCard(
             icon = if (isConnected) "success" else "error",
             title = if (isConnected) "연결됨: $deviceName" else "기기 연결이 필요합니다.",
@@ -74,9 +78,9 @@ fun HomeScreen(
             onClick = { if (isConnected) bleVm.disconnect() else onClickBle() },
             modifier = Modifier
                 .fillMaxWidth()
-                .height(90.dp),                          // ★ 원하는 고정 높이
-            contentPadding = PaddingValues(3.dp),        // ★ 내부 여백 축소
-            compact = true                               // ★ 텍스트/아이콘/버튼 여백도 컴팩트
+                .height(90.dp),
+            contentPadding = PaddingValues(3.dp),
+            compact = true
         )
 
         // 제목
@@ -95,43 +99,50 @@ fun HomeScreen(
                 contentAlignment = Alignment.Center
             ) { Text("로그인이 필요합니다.") }
         } else {
-            // 간단 통계
-            val last = points.lastOrNull()
+            // 통계 + 소스 라벨
+            val last = pointsDisplay.lastOrNull()
+            val sourceLabel = if (live.isNotEmpty() && isConnected) "실시간(BLE)" else "기록(Firebase)" // ★ 연결 off면 기록으로
+
             Row(
                 Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("샘플 수: ${points.size}")
-                Text("최근 L/R: " +
-                        "${last?.left?.let { "%.2f".format(it) } ?: "-"} / " +
-                        "${last?.right?.let { "%.2f".format(it) } ?: "-"}")
+                Text("샘플 수: ${pointsDisplay.size}", modifier = Modifier.weight(1f))
+                Text(
+                    sourceLabel,
+                    modifier = Modifier.weight(1f),
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.labelLarge
+                )
+                Text(
+                    "최근 L/R: " +
+                            "${last?.left?.let { "%.2f".format(it) } ?: "-"} / " +
+                            "${last?.right?.let { "%.2f".format(it) } ?: "-"}",
+                    modifier = Modifier.weight(1f),
+                    textAlign = TextAlign.End
+                )
             }
 
-            // 윈도우 선택 (버튼)
+            // 윈도우 선택
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                val opts = listOf(100, 150, 200)
-                opts.forEach { w ->
+                listOf(100, 150, 200).forEach { w ->
                     val selected = window == w
                     Button(
                         onClick = { window = w },
                         enabled = !selected,
-                        modifier = Modifier.weight(0.5f)
+                        modifier = Modifier.weight(1f)
                     ) { Text(if (selected) "표시 $w (선택됨)" else "표시 $w") }
                 }
             }
-//
-//            Spacer(Modifier.height(0.5.dp))
-//            Text("window = $window", style = MaterialTheme.typography.bodySmall)
 
-            // ✅ 그래프는 딱 한 번, window를 넘겨서 호출
-            HomeGraphSection(points = points, window = window)
+            // 그래프 (display 기준)
+            HomeGraphSection(points = pointsDisplay, window = window)
 
             Text(
                 "같은 날짜의 모든 세션(S_YYYYMMDD_*) records를 합쳐 시간순으로 표시합니다.",
                 style = MaterialTheme.typography.bodySmall
             )
-
-
         }
 
         Button(
@@ -145,6 +156,8 @@ fun HomeScreen(
         }
     }
 }
+
+/* --------------------------- Widgets --------------------------- */
 
 @Composable
 private fun DateChip() {
@@ -170,22 +183,62 @@ class HomeViewModel(
     private val repo: PpgRepository
 ) : ViewModel() {
 
+    // Firebase(오늘) 시리즈
     private val _today = MutableStateFlow<List<PpgPoint>>(emptyList())
-    val today: StateFlow<List<PpgPoint>> = _today
+    val today: StateFlow<List<PpgPoint>> = _today.asStateFlow()
 
+    // 실시간(BLE) 시리즈
+    private val _live = MutableStateFlow<List<PpgPoint>>(emptyList())
+    val live: StateFlow<List<PpgPoint>> = _live.asStateFlow()
+
+    // 로그인 상태
     private val _isLoggedIn = MutableStateFlow(false)
-    val isLoggedIn: StateFlow<Boolean> = _isLoggedIn
+    val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
+
+    // 화면용 최종 시리즈 (live가 있으면 live 우선)
+    val display: StateFlow<List<PpgPoint>> =
+        combine(today, live) { day, livePts ->
+            if (livePts.isNotEmpty()) livePts else day
+        }.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = emptyList()
+        )
 
     init {
         val uid = FirebaseAuth.getInstance().currentUser?.uid
         _isLoggedIn.value = uid != null
+
         if (uid != null) {
+            // 1) 오늘 날짜의 Firebase 수신
             viewModelScope.launch {
-                // 최신 날짜 자동 감지 버전이 있으면 그걸 쓰는 걸 추천:
-                // repo.observeLatestDayPpg(uid).collectLatest { _today.value = it }
                 repo.observeDayPpg(uid, LocalDate.now())
                     .collectLatest { _today.value = it }
             }
+
+            // 2) BLE 실시간 수신
+            viewModelScope.launch {
+                PpgRepository.smoothedFlow.collect { (l, r) ->
+                    addLivePoint(l, r)
+                }
+            }
+        }
+    }
+
+    /** BLE 연결 상태 반영: 끊기면 live 버퍼 비워서 자동으로 Firebase로 fallback */
+    fun onBleConnectionChanged(connected: Boolean) {
+        if (!connected) {
+            _live.value = emptyList() // ★ 즉시 비워서 display가 today로 전환됨
+        }
+    }
+
+    /** 실시간 버퍼에 포인트 추가(최대 1000개 유지) */
+    private fun addLivePoint(l: Float, r: Float) {
+        val now = System.currentTimeMillis()
+        val newPt = PpgPoint(ts = now, left = l.toDouble(), right = r.toDouble(), serverTs = now)
+        _live.update { cur ->
+            val capped = if (cur.size >= 1000) cur.drop(cur.size - 999) else cur
+            capped + newPt
         }
     }
 }
@@ -201,7 +254,7 @@ class HomeVmFactory(
     }
 }
 
-/* --------------------------- Graph UI --------------------------- */
+/* --------------------------- Graph --------------------------- */
 
 @Composable
 fun HomeGraphSection(
@@ -221,7 +274,7 @@ fun HomeGraphSection(
     // 최근 window개만 사용
     val slice = if (points.size > window) points.takeLast(window) else points
 
-    // y축 범위: 유효 값만으로 계산
+    // y축 범위 (유효 값만)
     val ys = slice.flatMap { listOfNotNull(it.left, it.right) }
     val (yLo, yHi) = if (ys.isNotEmpty()) {
         val minY = ys.minOrNull()!!
@@ -236,7 +289,7 @@ fun HomeGraphSection(
     val rightColor = MaterialTheme.colorScheme.tertiary
     val gridColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
 
-    // ── x축 라벨: server_ts → HH:mm:ss (없으면 ts 사용) ──
+    // x축 라벨: server_ts → HH:mm:ss (없으면 ts)
     val labelCount = when {
         slice.size <= 300  -> 4
         slice.size <= 600  -> 6
@@ -249,7 +302,7 @@ fun HomeGraphSection(
 
     val sdf = remember { java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()) }
     fun labelAt(idx: Int): String {
-        val ms = slice[idx].serverTs ?: slice[idx].ts   // ★ pointsSlice -> slice 로 수정
+        val ms = slice[idx].serverTs ?: slice[idx].ts
         return sdf.format(java.util.Date(ms))
     }
     val xLabels = labelIndices.map(::labelAt)
@@ -273,6 +326,7 @@ fun HomeGraphSection(
                     return (h - (t * h)).toFloat()
                 }
 
+                // Left
                 var prevL: Offset? = null
                 slice.forEachIndexed { i, p ->
                     val v = p.left ?: return@forEachIndexed
@@ -281,6 +335,7 @@ fun HomeGraphSection(
                     prevL = cur
                 }
 
+                // Right
                 var prevR: Offset? = null
                 slice.forEachIndexed { i, p ->
                     val v = p.right ?: return@forEachIndexed
@@ -299,7 +354,6 @@ fun HomeGraphSection(
             }
         }
 
-        // x축 라벨 (범례 없음)
         Spacer(Modifier.height(6.dp))
         Row(
             Modifier.fillMaxWidth(),
@@ -311,5 +365,3 @@ fun HomeGraphSection(
         }
     }
 }
-
-
