@@ -427,17 +427,35 @@ class PpgRepository(
 
     /** 세션ID "S_yyyyMMdd_HHmmss" → 그 시각의 epoch ms(로컬 타임존) */
     private fun sessionIdBaseEpochMs(sessionId: String): Long {
-        val parts = sessionId.split('_')
-        if (parts.size < 3) return 0L
-        val ymd = parts[1]; val hms = parts[2]
-        val dt = java.time.LocalDateTime.of(
-            ymd.substring(0,4).toInt(),
-            ymd.substring(4,6).toInt(),
-            ymd.substring(6,8).toInt(),
-            hms.substring(0,2).toInt(),
-            hms.substring(2,4).toInt(),
-            hms.substring(4,6).toInt()
-        )
-        return dt.atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        return try {
+            // Case A: S_yyyyMMdd_HHmmss(_suffix)
+            val m1 = Regex("""^S_(\d{8})_(\d{6})""").find(sessionId)
+            if (m1 != null) {
+                val (ymd, hms) = m1.destructured
+                val dt = java.time.LocalDateTime.of(
+                    ymd.substring(0, 4).toInt(),
+                    ymd.substring(4, 6).toInt(),
+                    ymd.substring(6, 8).toInt(),
+                    hms.substring(0, 2).toInt(),
+                    hms.substring(2, 4).toInt(),
+                    hms.substring(4, 6).toInt()
+                )
+                return dt.atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+            }
+
+            // Case B: ISO-8601(UTC)에서 시간 콜론만 '-'로 바꿔 저장된 형태
+            // 예: 2025-09-18T12-34-56.789Z_abcd1234
+            val m2 = Regex("""^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})""").find(sessionId)
+            if (m2 != null) {
+                val (Y, M, D, h, m, s) = m2.destructured
+                val dt = java.time.LocalDateTime.of(Y.toInt(), M.toInt(), D.toInt(), h.toInt(), m.toInt(), s.toInt())
+                // 위 형식은 UTC 기준으로 만든 것이므로 UTC로 간주
+                return dt.atZone(java.time.ZoneOffset.UTC).toInstant().toEpochMilli()
+            }
+
+            0L // 형식 미일치 시 fallback
+        } catch (_: Exception) {
+            0L
+        }
     }
 }

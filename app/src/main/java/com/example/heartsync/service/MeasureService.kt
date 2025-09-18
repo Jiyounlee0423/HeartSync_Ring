@@ -191,10 +191,13 @@ class MeasureService : Service() {
     // 헬퍼
     // -------------------------------
 
-    private fun newSessionId(): String {
-        val iso = OffsetDateTime.now(ZoneOffset.UTC).toString().replace(":", "-")
-        val suffix = UUID.randomUUID().toString().take(8)
-        return "${iso}_$suffix"
+    // 공통 권장 포맷: S_yyyyMMdd_HHmmss_<6자리랜덤>
+    fun newSessionId(): String {
+        val now = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Seoul"))
+        val day = now.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"))
+        val hms = now.format(java.time.format.DateTimeFormatter.ofPattern("HHmmss"))
+        val suffix = java.util.UUID.randomUUID().toString().take(6)
+        return "S_${day}_${hms}_${suffix}"
     }
 
     private fun utcIsoNow(): String =
