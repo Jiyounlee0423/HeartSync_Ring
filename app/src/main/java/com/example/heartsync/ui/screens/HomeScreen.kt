@@ -132,7 +132,7 @@ fun HomeScreen(
                         onClick = { window = w },
                         enabled = !selected,
                         modifier = Modifier.weight(1f)
-                    ) { Text(if (selected) "표시 $w (선택됨)" else "표시 $w") }
+                    ) { Text(if (selected) "표시 $w" else "표시 $w") }
                 }
             }
 
@@ -140,7 +140,7 @@ fun HomeScreen(
             HomeGraphSection(points = pointsDisplay, window = window)
 
             Text(
-                "같은 날짜의 모든 세션(S_YYYYMMDD_*) records를 합쳐 시간순으로 표시합니다.",
+                "기록은 같은 날짜의 모든 세션(S_YYYYMMDD_*) records를 합쳐 시간순으로 표시합니다.",
                 style = MaterialTheme.typography.bodySmall
             )
         }
