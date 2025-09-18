@@ -100,9 +100,10 @@ class PpgBleClient(
                 // STAT 라인은 Firestore 저장 시도
                 if (line.startsWith("STAT") || line.startsWith("ALERT")) {
                     repoScope.launch {
-                        com.example.heartsync.data.remote.PpgRepository
-                            .instance
-                            .trySaveFromLine(line)   // ★ 바뀐 함수명
+                        // 둘 중 하나로 통일
+                        com.example.heartsync.data.remote.PpgRepository.trySaveFromLine(line)
+                        // 또는
+                        // com.example.heartsync.data.remote.PpgRepository.instance.trySaveFromLine(line)
                     }
                 }
 
@@ -396,4 +397,5 @@ class PpgBleClient(
             onError("Descriptor write 권한 오류")
         }
     }
+
 }

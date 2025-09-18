@@ -16,13 +16,23 @@ fun StatusCard(
     icon: String,           // "success" or "error"
     title: String,
     buttonText: String,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,                          // ← 실제로 받기
+    contentPadding: PaddingValues = PaddingValues(16.dp),   // ← 내부 패딩 조절
+    compact: Boolean = false                                // ← 컴팩트 모드(선택)
 ) {
-    Surface(shape = MaterialTheme.shapes.large, tonalElevation = 4.dp) {
+    val iconSize = if (compact) 20.dp else 32.dp
+    val vSpace   = if (compact) 8.dp  else 12.dp
+
+    Surface(
+        modifier = modifier,                                 // ← ★ 높이/폭 제어점
+        shape = MaterialTheme.shapes.large,
+        tonalElevation = 4.dp
+    ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(20.dp),
+                .padding(contentPadding),                   // ← ★ 내부 패딩 적용
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             // ✅ / ❌ 아이콘
@@ -30,28 +40,34 @@ fun StatusCard(
                 Icon(
                     Icons.Default.Check,
                     contentDescription = null,
-                    tint = Color(0xFF2E7D32), // 초록색
-                    modifier = Modifier.size(32.dp)
+                    tint = Color(0xFF2E7D32),
+                    modifier = Modifier.size(iconSize)
                 )
             } else {
                 Icon(
                     Icons.Default.Close,
                     contentDescription = null,
-                    tint = Color(0xFFC62828), // 빨간색
-                    modifier = Modifier.size(32.dp)
+                    tint = Color(0xFFC62828),
+                    modifier = Modifier.size(iconSize)
                 )
             }
 
-            Spacer(Modifier.height(12.dp))
-            Text(title, style = MaterialTheme.typography.bodyLarge)
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(vSpace))
+            Text(
+                title,
+                style = if (compact) MaterialTheme.typography.bodyMedium
+                else MaterialTheme.typography.bodyLarge
+            )
+            Spacer(Modifier.height(vSpace))
 
             Button(
                 onClick = onClick,
                 modifier = Modifier.fillMaxWidth(0.7f),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.surfaceVariant
-                )
+                ),
+                contentPadding = if (compact) PaddingValues(vertical = 6.dp, horizontal = 10.dp)
+                else ButtonDefaults.ContentPadding
             ) {
                 Text(buttonText)
             }

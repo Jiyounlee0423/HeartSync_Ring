@@ -1,139 +1,253 @@
-// app/src/main/java/com/example/HeartSync/data/remote/PpgRepository.kt
+// app/src/main/java/com/example/heartsync/data/remote/PpgRepository.kt
 package com.example.heartsync.data.remote
 
 import android.util.Log
 import com.example.heartsync.data.model.PpgEvent
-import com.google.firebase.firestore.FieldValue
-import com.google.firebase.firestore.FirebaseFirestore
-import com.google.firebase.firestore.Source
+import com.example.heartsync.data.remote.PpgRepository.Companion.instance
+import com.google.firebase.firestore.*
 import kotlinx.coroutines.channels.awaitClose
-import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.tasks.await
-import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.firestore.DocumentChange
-import com.google.firebase.firestore.Query
-import kotlinx.coroutines.flow.Flow
+import java.lang.System.err
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import com.google.firebase.firestore.SetOptions
 
+data class PpgPoint(
+    val ts: Long,                 // 기존: 로컬/상대 ms
+    val left: Double?,
+    val right: Double?,
+    val serverTs: Long? = null    // ★ 추가: server_ts epoch ms
+)
 
 class PpgRepository(
     private val db: FirebaseFirestore
 ) {
     @Volatile private var sessionId: String = ""
-
-    /** MeasureService 등에서 1회 세션ID 세팅 */
-    fun setSessionId(id: String) {
-        sessionId = id
-        Log.d("PpgRepo", "sessionId set -> $sessionId")
-    }
-
-    /** 필요시 현재 세션 조회 */
-    fun getSessionId(): String? = sessionId
-
-
-    private fun col(userId: String, sessionId: String) =
-        db.collection("ppg_events")
-            .document(userId)
-            .collection("sessions")
-            .document(sessionId)
-            .collection("records")
-
-    // 클래스 멤버에 추가 (쓰로틀 상태)
     @Volatile private var lastWriteMs: Long = 0L
 
-    /** STAT/ALERT 라인 공통 처리 */
-    suspend fun trySaveFromLine(line: String) {
-        // 1) 이벤트 타입 추출 (맨 앞 토큰)
-        val eventType = line.substringBefore(' ').trim()
-        if (eventType != "STAT" && eventType != "ALERT") return
+    /** 외부에서 현재 세션 ID 세팅/조회 */
+    fun setSessionId(id: String) { sessionId = id; Log.d("PpgRepo", "sessionId set -> $sessionId") }
+    fun getSessionId(): String? = sessionId
 
-        Log.d("PpgRepo", "trySaveFromLine IN: ${eventType} ${line.take(100)}")
+    private fun recordsCol(userId: String, sessionId: String) =
+        db.collection("ppg_events").document(userId)
+            .collection("sessions").document(sessionId)
+            .collection("records")
 
-        // 2) 파싱
-        val ev = parseStatLikeLine(line, eventType) ?: run {
-            Log.w("PpgRepo", "parse fail ($eventType)")
-            return
+    /* ============================================================
+     *  A) 하루치 통합 스트림 (문서ID: S_yyyyMMdd_HHmmss 기준)
+     * ============================================================ */
+
+    /** 오늘(혹은 지정 날짜)의 세션들을 찾아 records를 합쳐 흘려보냄 */
+    fun observeDayPpg(uid: String, date: LocalDate): Flow<List<PpgPoint>> = callbackFlow {
+        val dayStr = date.format(DateTimeFormatter.ofPattern("yyyyMMdd"))
+        val start = "S_${dayStr}_"
+        val end = "S_${dayStr}_\uf8ff"
+
+        val sessionQuery = db.collection("ppg_events")
+            .document(uid).collection("sessions")
+            .whereGreaterThanOrEqualTo(FieldPath.documentId(), start)
+            .whereLessThanOrEqualTo(FieldPath.documentId(), end)
+
+        val recordRegs = mutableListOf<ListenerRegistration>()
+        val latestBySession = mutableMapOf<String, List<PpgPoint>>()
+
+        fun pushCombined() {
+            // 이제 ts가 절대시간이므로 이것만으로 시간순 정렬됨
+            val combined = latestBySession.values.flatten().sortedBy { it.ts }
+            trySend(combined)
         }
 
-        // 3) uid/세션 확보
-        val uid = FirebaseAuth.getInstance().currentUser?.uid ?: run {
-            Log.e("PpgRepo", "uid null -> skip")
-            return
-        }
-        val sid = if (sessionId.isNotBlank()) sessionId
-        else "S_${System.currentTimeMillis()}".also {
-            sessionId = it
-            Log.d("PpgRepo", "sessionId (auto) -> $sessionId")
+
+
+        val sessionReg = sessionQuery.addSnapshotListener { snap, err ->
+            if (err != null) { Log.e("PpgRepository", "session listen error", err); return@addSnapshotListener }
+
+            recordRegs.forEach { it.remove() }
+            recordRegs.clear()
+            latestBySession.clear()
+
+            snap?.documents?.forEach { sdoc ->
+                val base = sessionIdBaseEpochMs(sdoc.id)              // ✅ sdoc
+                val reg = sdoc.reference.collection("records")
+                    .orderBy("ts_ms")
+                    .addSnapshotListener { recSnap, recErr ->
+                        if (recErr != null) return@addSnapshotListener
+                        val list = recSnap?.documents?.mapNotNull { d ->
+                            val rel = (d.getLong("ts_ms") ?: d.getLong("ts") ?: d.getLong("timestamp") ?: d.getLong("idx"))
+                                ?: return@mapNotNull null
+
+                            val left  = getDoubleAny(d, "smoothed_left","Smoothed_Left","smooted_left","PPGf_L","ppgf_l","PPG_L")
+                            val right = getDoubleAny(d, "smoothed_right","Smoothed_Right","smooted_right","PPGf_R","ppgf_r","PPG_R")
+                            val serverTs = d.getTimestamp("server_ts")?.toDate()?.time
+                            val absTs = serverTs ?: (base + rel)
+
+                            PpgPoint(ts = absTs, left = left, right = right, serverTs = serverTs)
+                        } ?: emptyList()
+
+                        latestBySession[sdoc.id] = list                 // ✅ sdoc
+                        trySend(latestBySession.values.flatten().sortedBy { it.ts })
+                    }
+                recordRegs.add(reg)
+            }
         }
 
-        // 4) 쓰로틀: ALERT는 즉시 저장, STAT는 최소 간격 유지
-        val now = System.currentTimeMillis()
-        val shouldWrite = (eventType == "ALERT") || (now - lastWriteMs >= MIN_INTERVAL_MS)
-        if (!shouldWrite) return
-        lastWriteMs = now
+        awaitClose {
+            sessionReg.remove()
+            recordRegs.forEach { it.remove() }
+        }
+    }.distinctUntilChanged()
 
-        Log.d("PpgRepo", "upload start: $eventType uid=$uid sid=$sid ts=${ev.ts_ms}")
-        uploadRecord(uid, sid, ev)
+    /** 최신 세션 날짜를 자동 감지해서 그 날짜로 observe */
+    fun observeLatestDayPpg(uid: String): Flow<List<PpgPoint>> = callbackFlow {
+        val root = db.collection("ppg_events").document(uid).collection("sessions")
+        var innerReg: ListenerRegistration? = null
+
+        val outerReg = root
+            .orderBy(FieldPath.documentId(), Query.Direction.DESCENDING)
+            .limit(1)
+            .addSnapshotListener { snap, err ->
+                if (err != null) { close(err); return@addSnapshotListener }
+                val latestId = snap?.documents?.firstOrNull()?.id
+                val dayStr = latestId?.split('_')?.getOrNull(1) ?: return@addSnapshotListener
+
+                innerReg?.remove()
+                innerReg = observeDayListener(uid, dayStr) { list -> trySend(list) }
+            }
+
+        awaitClose {
+            outerReg.remove()
+            innerReg?.remove()
+        }
     }
 
-    /** STAT/ALERT 공통 포맷 파싱 */
-    private fun parseStatLikeLine(line: String, eventType: String): PpgEvent? {
-        fun <T> num(key: String, conv: (String)->T): T? =
-            Regex("""\b$key=([-\d.]+)""").find(line)?.groupValues?.getOrNull(1)?.let(conv)
+    /** 내부 헬퍼: 특정 yyyyMMdd를 실시간으로 합쳐 콜백 */
+    private fun observeDayListener(
+        uid: String,
+        dayStr: String,
+        onData: (List<PpgPoint>) -> Unit
+    ): ListenerRegistration {
+        val start = "S_${dayStr}_"
+        val end = "S_${dayStr}_\uf8ff"
+        val sessionQuery = db.collection("ppg_events").document(uid).collection("sessions")
+            .whereGreaterThanOrEqualTo(FieldPath.documentId(), start)
+            .whereLessThanOrEqualTo(FieldPath.documentId(), end)
 
-        // 여러 키 중 하나라도 있으면 우선 사용
-        fun numAny(vararg keys: String): Double? {
-            for (k in keys) {
-                val v = num(k) { it.toDouble() }
-                if (v != null) return v
+        val recordRegs = mutableListOf<ListenerRegistration>()
+        val latestBySession = mutableMapOf<String, List<PpgPoint>>()
+
+        fun pushCombined() = onData(latestBySession.values.flatten().sortedBy { it.ts })
+
+        val sessionReg = sessionQuery.addSnapshotListener { snap, _ ->
+            recordRegs.forEach { it.remove() }
+            recordRegs.clear()
+            latestBySession.clear()
+
+            snap?.documents?.forEach { sdoc ->
+                val base = sessionIdBaseEpochMs(sdoc.id)              // ✅ sdoc
+                val reg = sdoc.reference.collection("records")
+                    .orderBy("ts_ms")
+                    .addSnapshotListener { recSnap, _ ->
+                        val list = recSnap?.documents?.mapNotNull { d ->
+                            val rel = (d.getLong("ts_ms") ?: d.getLong("ts") ?: d.getLong("timestamp") ?: d.getLong("idx"))
+                                ?: return@mapNotNull null
+
+                            val left  = getDoubleAny(d, "smoothed_left","Smoothed_Left","smooted_left","PPGf_L","ppgf_l","PPG_L")
+                            val right = getDoubleAny(d, "smoothed_right","Smoothed_Right","smooted_right","PPGf_R","ppgf_r","PPG_R")
+                            val serverTs = d.getTimestamp("server_ts")?.toDate()?.time
+                            val absTs = serverTs ?: (base + rel)
+
+                            PpgPoint(ts = absTs, left = left, right = right, serverTs = serverTs)
+                        } ?: emptyList()
+
+                        latestBySession[sdoc.id] = list                 // ✅ sdoc
+                        onData(latestBySession.values.flatten().sortedBy { it.ts })
+                    }
+                recordRegs.add(reg)
             }
-            return null
         }
 
-        val ts   = num("ts") { it.toLong() } ?: return null
+        return sessionReg
+    }
+
+    /** 최신 세션 1개 문서ID에서 yyyyMMdd만 추출 (동기 호출이 필요할 때 사용) */
+    suspend fun fetchLatestDay(uid: String): String? {
+        val qs = db.collection("ppg_events").document(uid)
+            .collection("sessions")
+            .orderBy(FieldPath.documentId(), Query.Direction.DESCENDING)
+            .limit(1)
+            .get()
+            .await()
+
+        val id = qs.documents.firstOrNull()?.id ?: return null
+        val parts = id.split('_')
+        return if (parts.size >= 3) parts[1] else null
+    }
+
+    /* ============================================================
+     *  B) 업로드/최근레코드 유틸
+     * ============================================================ */
+
+    /** STAT/ALERT 공통 파서 (필요 시 사용) */
+    private fun parseStatLikeLine(line: String, eventType: String): PpgEvent? {
+        fun <T> num(key: String, conv: (String) -> T): T? =
+            Regex("""\b$key=([-\d.]+)""").find(line)?.groupValues?.getOrNull(1)?.let(conv)
+        fun numAny(vararg keys: String): Double? {
+            for (k in keys) num(k) { it.toDouble() }?.let { return it }
+            return null
+        }
+        val ts = num("ts") { it.toLong() } ?: return null
         val side = Regex("""\bside=([A-Za-z_]+)""").find(line)?.groupValues?.getOrNull(1)
 
-        // ✅ 아두이노 전송 키 대응
         val ppgfL = numAny("PPGf_L", "PPG_L", "PPG_left")
         val ppgfR = numAny("PPGf_R", "PPG_R", "PPG_right")
 
         return PpgEvent(
-            event = eventType,              // ★ STAT 또는 ALERT 로 들어감
-            host_time_iso = "",             // 필요시 ISO 시간 넣어도 됨
+            event = eventType,
+            host_time_iso = "",
             ts_ms = ts,
-
-            alert_type = if (eventType == "ALERT") "device" else null, // 필요시 조정
+            alert_type = if (eventType == "ALERT") "device" else null,
             reasons = null,
-
-            AmpRatio = num("AmpRatio"){ it.toDouble() },
-            PAD_ms   = num("PAD"){ it.toDouble() },
-            dSUT_ms  = num("dSUT"){ it.toDouble() },
-
-            ampL = num("ampL"){ it.toDouble() },
-            ampR = num("ampR"){ it.toDouble() },
-
-            SUTL_ms = num("SUTL"){ it.toDouble() },
-            SUTR_ms = num("SUTR"){ it.toDouble() },
-
-            BPM_L = num("BPM_L"){ it.toDouble() },
-            BPM_R = num("BPM_R"){ it.toDouble() },
-
-            PQIL = num("PQIL"){ it.toDouble() }?.toInt(),
-            PQIR = num("PQIR"){ it.toDouble() }?.toInt(),
-
+            AmpRatio = num("AmpRatio") { it.toDouble() },
+            PAD_ms   = num("PAD")      { it.toDouble() },
+            dSUT_ms  = num("dSUT")     { it.toDouble() },
+            ampL = num("ampL") { it.toDouble() },
+            ampR = num("ampR") { it.toDouble() },
+            SUTL_ms = num("SUTL") { it.toDouble() },
+            SUTR_ms = num("SUTR") { it.toDouble() },
+            BPM_L = num("BPM_L") { it.toDouble() },
+            BPM_R = num("BPM_R") { it.toDouble() },
+            PQIL = num("PQIL") { it.toDouble() }?.toInt(),
+            PQIR = num("PQIR") { it.toDouble() }?.toInt(),
             side = side,
-
             smoothed_left  = ppgfL,
             smoothed_right = ppgfR,
         )
     }
+    // 부모 세션 문서를 항상 만들어 둔다 (없으면 생성, 있으면 merge)
+    private suspend fun ensureSessionDoc(uid: String, sessionId: String) {
+        val day = sessionId.substring(2, 10) // "S_20250918_150444" -> "20250918"
+        val meta = mapOf(
+            "created_at" to FieldValue.serverTimestamp(),
+            "day" to day,
+            "id" to sessionId
+        )
+        db.collection("ppg_events").document(uid)
+            .collection("sessions").document(sessionId)
+            .set(meta, SetOptions.merge())
+            .await()
+    }
+
 
     suspend fun uploadRecord(userId: String, sessionId: String, ev: PpgEvent): String {
+        ensureSessionDoc(userId, sessionId)
 
         val path = "ppg_events/$userId/sessions/$sessionId/records"
-
         val map = hashMapOf(
             "event" to ev.event,
             "host_time_iso" to ev.host_time_iso,
@@ -158,43 +272,26 @@ class PpgRepository(
         )
 
         return try {
-            // 디버깅용 간단 요약 로그
-            android.util.Log.d("PpgRepo",
-                "write try: $path  event=${ev.event} ts_ms=${ev.ts_ms} " +
-                        "AmpRatio=${ev.AmpRatio} leftAmp=${ev.ampL} rightAmp=${ev.ampR}"
-            )
-
-            val ref = col(userId, sessionId).document()
+            Log.d("PpgRepo", "write try: $path  event=${ev.event} ts_ms=${ev.ts_ms}")
+            val ref = recordsCol(userId, sessionId).document()
             ref.set(map).await()
-
-            // 서버에서 강제 읽기 (오프라인/퍼미션 문제면 여기서 예외)
             val snap = ref.get(Source.SERVER).await()
             Log.d("PpgRepo", "server read ok: exists=${snap.exists()}")
-
-            android.util.Log.d("PpgRepo", "write OK: $path/${ref.id}")
+            Log.d("PpgRepo", "write OK: $path/${ref.id}")
             ref.id
         } catch (t: Throwable) {
-            android.util.Log.e("PpgRepo", "write FAIL: $path", t)
+            Log.e("PpgRepo", "write FAIL: $path", t)
             throw t
         }
     }
 
-    /**
-     * 세션 레코드 실시간 구독 (UI에서 바로 씀)
-     * orderBy는 server_ts(서버시간) 기준, 최신 N개
-     */
-    private fun readNumberFlexible(d: com.google.firebase.firestore.DocumentSnapshot, key: String): Double? {
-        d.getDouble(key)?.let { return it }                // 숫자로 저장된 경우
-        val arr = d.get(key) as? List<*>                  // 예전 문서: 배열 첫 원소
-        val first = arr?.firstOrNull() as? Number
-        return first?.toDouble()
-    }
+    /** 최근 레코드(서버타임순) 구독 */
     fun observeRecent(
         userId: String,
         sessionId: String,
         limit: Long = 200
     ) = callbackFlow<List<PpgEvent>> {
-        val qs = col(userId, sessionId)
+        val qs = recordsCol(userId, sessionId)
             .orderBy("server_ts")
             .limitToLast(limit)
 
@@ -206,85 +303,69 @@ class PpgRepository(
                         event = d.getString("event") ?: "STAT",
                         host_time_iso = d.getString("host_time_iso") ?: "",
                         ts_ms = (d.getLong("ts_ms") ?: 0L),
-
                         alert_type = d.getString("alert_type"),
                         reasons = (d.get("reasons") as? List<*>)?.mapNotNull { it as? String },
-
                         AmpRatio = d.getDouble("AmpRatio"),
                         PAD_ms = d.getDouble("PAD_ms"),
                         dSUT_ms = d.getDouble("dSUT_ms"),
-
                         ampL = d.getDouble("ampL"),
                         ampR = d.getDouble("ampR"),
-
                         SUTL_ms = d.getDouble("SUTL_ms"),
                         SUTR_ms = d.getDouble("SUTR_ms"),
-
                         BPM_L = d.getDouble("BPM_L"),
                         BPM_R = d.getDouble("BPM_R"),
-
                         PQIL = (d.getLong("PQIL") ?: d.getDouble("PQIL")?.toLong())?.toInt(),
                         PQIR = (d.getLong("PQIR") ?: d.getDouble("PQIR")?.toLong())?.toInt(),
-
                         side = d.getString("side"),
-
                         smoothed_left  = readNumberFlexible(d, "smoothed_left"),
                         smoothed_right = readNumberFlexible(d, "smoothed_right"),
                     )
-                } catch (_: Exception) {
-                    null
-                }
+                } catch (_: Exception) { null }
             }
             trySend(items)
         }
         awaitClose { reg.remove() }
     }
 
+    /* ============================================================
+     *  C) 가벼운 실시간 값 허브 (BLE/Service → UI)
+     * ============================================================ */
+
+    // PpgRepository.kt 내부, 클래스 본문에서 단 하나만 존재해야 함
     companion object {
-        /**
-         * 실시간 스무딩 샘플 스트림 (좌/우 한 점씩)
-         * - 최신 샘플을 가볍게 흘려보내기 위한 허브
-         * - UI: PpgRepository.smoothedFlow.collect { (l, r) -> ... }
-         * - Service/BLE: PpgRepository.emitSmoothed(l, r)
-         */
-        private const val MIN_INTERVAL_MS = 200L   // ≈ 5Hz. 필요에 맞게 100~500ms로 조정
-
+        // --- 기존에 쓰던 값/흐름들 유지 ---
+        private const val MIN_INTERVAL_MS = 100L
         private val _smoothedFlow =
-            MutableSharedFlow<Pair<Float, Float>>(
-                replay = 1, extraBufferCapacity = 256
+            kotlinx.coroutines.flow.MutableSharedFlow<Pair<Float, Float>>(
+                replay = 1,
+                extraBufferCapacity = 256
             )
+        val smoothedFlow: kotlinx.coroutines.flow.SharedFlow<Pair<Float, Float>> = _smoothedFlow
 
-        val smoothedFlow: SharedFlow<Pair<Float, Float>> = _smoothedFlow
+        // 앱 전역에서 쓰는 싱글톤 인스턴스
+        val instance: PpgRepository by lazy { PpgRepository(com.google.firebase.firestore.FirebaseFirestore.getInstance()) }
 
-        // 싱글톤 인스턴스
-        val instance: PpgRepository by lazy { PpgRepository(FirebaseFirestore.getInstance()) }
-
-        /**
-         * 생산자(서비스/블루투스)에서 호출: 스무딩된 좌/우 값을 방출
-         * Number를 받도록 해서 Float/Double 둘 다 허용
-         */
+        // BLE/서비스 쪽에서 가벼운 실시간 값 넣을 때 사용
         fun emitSmoothed(left: Number, right: Number) {
             _smoothedFlow.tryEmit(left.toFloat() to right.toFloat())
         }
 
+        // ✅ 정적 위임: BLE가 PpgRepository.trySaveFromLine(line) 형태로 부를 수 있게
+        suspend fun trySaveFromLine(line: String): Boolean =
+            instance.trySaveFromLine(line)
     }
 
     fun pushSmoothed(l: Float, r: Float) {
         _smoothedFlow.tryEmit(l to r)
     }
 
-
-    // PpgRepository.kt
     fun observeSmoothedFromFirestore(
         uid: String,
         sessionId: String,
         limit: Long = 512L
     ): Flow<Pair<Float, Float>> = callbackFlow {
-        val ref = FirebaseFirestore.getInstance()
-            .collection("ppg_events")
-            .document(uid)
-            .collection("sessions")
-            .document(sessionId)
+        val ref = db.collection("ppg_events").document(uid)
+            .collection("sessions").document(sessionId)
             .collection("records")
             .orderBy("ts_ms", Query.Direction.DESCENDING)
             .limit(limit)
@@ -293,12 +374,9 @@ class PpgRepository(
             if (err != null) { close(err); return@addSnapshotListener }
             if (snap == null) return@addSnapshotListener
 
-            // 최신 → 오래된 순으로 오니 시간순으로 뒤집어서 보냄
             for (d in snap.documents.asReversed()) {
-                // 숫자/문자 혼합 저장 대비
                 fun num(key: String): Double? =
                     d.getDouble(key) ?: (d.get(key) as? Number)?.toDouble()
-
                 val l = num("smoothed_left")
                 val r = num("smoothed_right")
                 if (l != null && r != null) trySend(l.toFloat() to r.toFloat())
@@ -306,4 +384,97 @@ class PpgRepository(
         }
         awaitClose { reg.remove() }
     }
+
+    /* ============================================================
+     *  D) 공통 유틸
+     * ============================================================ */
+
+    private fun readNumberFlexible(d: DocumentSnapshot, key: String): Double? {
+        d.getDouble(key)?.let { return it }
+        val arr = d.get(key) as? List<*>
+        val first = arr?.firstOrNull() as? Number
+        return first?.toDouble()
+    }
+
+    /** 문서에서 후보 키들 중 첫 번째로 존재하는 값을 Double로 파싱 */
+    private fun getDoubleAny(doc: DocumentSnapshot, vararg keys: String): Double? {
+        for (k in keys) {
+            when (val v = doc.get(k)) {
+                is Number -> return v.toDouble()
+                is String -> v.toDoubleOrNull()?.let { return it }
+            }
+        }
+        return null
+    }
+    // 1) uid + sessionId + line 모두 아는 버전
+    suspend fun trySaveFromLine(uid: String, sessionId: String, line: String): Boolean {
+        val eventType = when {
+            line.startsWith("STAT")  -> "STAT"
+            line.startsWith("ALERT") -> "ALERT"
+            else -> return false
+        }
+        val ev = parseStatLikeLine(line, eventType) ?: return false
+        uploadRecord(uid, sessionId, ev)
+        return true
+    }
+
+    // 2) uid/세션ID를 Repo가 기억한 값으로 쓰는 버전
+    suspend fun trySaveFromLine(line: String): Boolean {
+        val uid = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.uid ?: return false
+        val sid = getSessionId() ?: return false
+        return trySaveFromLine(uid, sid, line)
+    }
+
+    private fun observeOneSessionRecords(
+        uid: String,
+        sessionId: String,
+        onData: (List<PpgPoint>) -> Unit
+    ): ListenerRegistration {
+        return db.collection("ppg_events").document(uid)
+            .collection("sessions").document(sessionId)
+            .collection("records")
+            .orderBy("ts_ms")
+            .addSnapshotListener { recSnap, recErr ->
+                if (recErr != null) {
+                    Log.e("PpgRepo", "records listen error (direct) for $sessionId", recErr)
+                    return@addSnapshotListener
+                }
+                Log.d("PpgRepo", "records (direct) for $sessionId: count=${recSnap?.size() ?: 0}")
+
+                val list = recSnap?.documents?.mapNotNull { d ->
+                    val ts = (d.getLong("ts_ms")
+                        ?: d.getLong("ts")
+                        ?: d.getLong("timestamp")
+                        ?: d.getLong("idx")) ?: return@mapNotNull null
+
+                    val left  = getDoubleAny(d,
+                        "smoothed_left","Smoothed_Left","smooted_left","PPGf_L","ppgf_l","PPG_L","ampL")
+                    val right = getDoubleAny(d,
+                        "smoothed_right","Smoothed_Right","smooted_right","PPGf_R","ppgf_r","PPG_R","ampR")
+
+                    val serverTs = d.getTimestamp("server_ts")?.toDate()?.time   // ★ 추가
+
+                    PpgPoint(ts, left, right, serverTs)                          // ★ 변경
+                } ?: emptyList()
+
+                onData(list)
+            }
+    }
+    private fun sessionIdBaseEpochMs(sessionId: String): Long {
+        // S_20250918_145449
+        val parts = sessionId.split('_')
+        if (parts.size < 3) return 0L
+        val ymd = parts[1]; val hms = parts[2]
+        val dt = java.time.LocalDateTime.of(
+            ymd.substring(0,4).toInt(),
+            ymd.substring(4,6).toInt(),
+            ymd.substring(6,8).toInt(),
+            hms.substring(0,2).toInt(),
+            hms.substring(2,4).toInt(),
+            hms.substring(4,6).toInt()
+        )
+        return dt.atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+    }
+
+
 }
