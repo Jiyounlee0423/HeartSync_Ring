@@ -283,6 +283,31 @@ class PpgRepository(
             return false
         }
     }
+    private fun parseReasonsFromLine(line: String): List<String> {
+        // 1) reasons=... 혹은 reasons=[...]
+        Regex("""\b(reasons?|Reasons?)\s*=\s*\[?([^\]\r\n]+?)\]?(?=\s+[A-Za-z_]\w*\s*=|$)""")
+            .find(line)?.let { m ->
+                val raw = m.groupValues.getOrNull(2)?.trim().orEmpty()
+                val toks = raw.split(',', ';', '|', '、', '；')
+                    .map { it.trim().trim('"', '\'') }
+                    .filter { it.isNotEmpty() }
+                if (toks.isNotEmpty()) return toks
+            }
+        // 2) R0=..., R1=... 수집
+        val rTokens = Regex("""\bR\d+\s*=\s*([^\s]+)""").findAll(line)
+            .map { it.groupValues.getOrNull(1)?.trim()?.trim('"', '\'') ?: "" }
+            .filter { it.isNotEmpty() }
+            .toList()
+        if (rTokens.isNotEmpty()) return rTokens
+
+        // 3) 없으면 빈 리스트
+        return emptyList()
+    }
+    /** alert_type 추출 (alert_type / alertType / AlertType 모두 지원) */
+    private fun parseAlertTypeFromLine(line: String): String? =
+        Regex("""\b(alert_?type|alertType|AlertType|type)\s*=\s*([A-Za-z0-9_\-]+)""")
+            .find(line)
+            ?.groupValues?.getOrNull(2)
 
     /* ============================================================
      *  C) 업로드 & 최근 관측(선택)
@@ -317,10 +342,12 @@ class PpgRepository(
 //        }
 //        return ref.id
         // 로그 분해 확인을 위해 보류
+        val uid = FirebaseAuth.getInstance().currentUser?.uid ?: ""
         Log.d("PpgRepo","uploadRecord ENTER (sid=$sessionId)")
         val ref = recordsCol(userId, sessionId).document()
         Log.d("PpgRepo","set() path=ppg_events/$userId/sessions/$sessionId/records/${ref.id}")
         val map = hashMapOf(
+            "ownerUid" to uid,
             "event" to ev.event,
             "host_time_iso" to ev.host_time_iso,
             "ts_ms" to ev.ts_ms,
@@ -468,6 +495,7 @@ class PpgRepository(
         } catch (_: Exception) { 0L }
     }
 
+
     /** STAT / ALERT 라인 공통 파서 */
     private fun parseStatLikeLine(line: String, eventType: String): PpgEvent? {
         fun <T> num(key: String, conv: (String) -> T): T? =
@@ -481,12 +509,16 @@ class PpgRepository(
         val ppgfL = numAny("PPGf_L", "PPG_L", "PPG_left")
         val ppgfR = numAny("PPGf_R", "PPG_R", "PPG_right")
 
+        // ★ 추가: 라인에서 직접 추출
+        val parsedReasons = parseReasonsFromLine(line)
+        val parsedAlertType = parseAlertTypeFromLine(line)
+
         return PpgEvent(
             event = eventType,
             host_time_iso = "",
             ts_ms = ts,
-            alert_type = if (eventType == "ALERT") "asymmetry" else null,
-            reasons = null,
+            alert_type = parsedAlertType ?: if (eventType == "ALERT") "asymmetry" else null,
+            reasons = if (parsedReasons.isEmpty()) null else parsedReasons, // null이면 필드 생략
             AmpRatio = num("AmpRatio") { it.toDouble() },
             PAD_ms   = num("PAD")      { it.toDouble() },
             dSUT_ms  = num("dSUT")     { it.toDouble() },
