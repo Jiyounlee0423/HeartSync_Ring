@@ -230,6 +230,10 @@ class PpgRepository(
             instance.trySaveFromLineInternal(line)
     }
 
+    // PpgRepository 클래스 본문 어딘가 (companion object 바깥)
+    suspend fun trySaveFromLinePublic(line: String): Boolean =
+        trySaveFromLineInternal(line)
+
     private suspend fun trySaveFromLineInternal(line: String): Boolean {
         val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return false
         val sid = getSessionId() ?: return false
@@ -418,5 +422,37 @@ class PpgRepository(
             smoothed_left  = ppgfL,
             smoothed_right = ppgfR
         )
+    }
+
+    fun observeSmoothedFromFirestore(
+        uid: String,
+        sessionId: String,
+        limit: Long
+    ): Flow<Pair<Float, Float>> {
+        return callbackFlow {
+            val query = db.collection("users")
+                .document(uid)
+                .collection("sessions")
+                .document(sessionId)
+                .collection("records")
+                .orderBy("ts")
+                .limit(limit)
+
+            val listener = query.addSnapshotListener { snap, e ->
+                if (e != null) {
+                    close(e)
+                    return@addSnapshotListener
+                }
+                if (snap != null) {
+                    for (doc in snap.documents) {
+                        val l = doc.getDouble("smoothed_left")?.toFloat() ?: continue
+                        val r = doc.getDouble("smoothed_right")?.toFloat() ?: continue
+                        trySend(l to r)
+                    }
+                }
+            }
+
+            awaitClose { listener.remove() }
+        }
     }
 }

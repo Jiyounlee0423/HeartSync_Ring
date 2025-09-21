@@ -78,10 +78,10 @@ class HomeViewModel(
                 if (liveBuffer.size >= LIVE_WINDOW) liveBuffer.removeFirst()
                 liveBuffer.addLast(
                     PpgPoint(
-                        ts = now,                 // x축(절대시간)으로 사용
+                        time = now,
                         left = l.toDouble(),
                         right = r.toDouble(),
-                        serverTs = now            // 선택: 동일값 넣어도 무방
+                        serverTime = now
                     )
                 )
 

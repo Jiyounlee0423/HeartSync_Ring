@@ -6,7 +6,7 @@ import android.content.Intent
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.example.heartsync.data.model.PpgEvent
+import com.example.heartsync.data.remote.PpgEvent
 import com.example.heartsync.data.remote.PpgRepository
 import com.example.heartsync.ble.PpgBleClient
 import com.example.heartsync.data.model.BleDevice
