@@ -24,6 +24,9 @@ import java.util.UUID
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.Date
+import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 
 class MeasureService : Service() {
@@ -55,49 +58,54 @@ class MeasureService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val sid = "S_" + java.text.SimpleDateFormat(
-            "yyyyMMdd_HHmmss", java.util.Locale.US
-        ).format(java.util.Date())
-        PpgRepository.instance.setSessionId(sid)   // ★ 인스턴스로 호출
-
-        val auth = FirebaseAuth.getInstance()
-        if (auth.currentUser == null) {
-            auth.signInAnonymously()
-                .addOnSuccessListener { Log.d("MeasureService", "Anon sign-in in service") }
-                .addOnFailureListener { Log.e("MeasureService", "Anon sign-in failed", it) }
-        }
-
-        val app = com.google.firebase.FirebaseApp.getInstance()
-        val opt = app.options
-        Log.d("FB", "proj=${opt.projectId}, appId=${opt.applicationId}, dbUrl=${opt.databaseUrl}")
-
-        // 포그라운드 알림 채널 보장
         NotificationHelper.ensureChannel(this, NOTI_CHANNEL_ID, "HeartSync Measure")
-
-        // 초기 알림
-        val noti = NotificationCompat.Builder(this, NOTI_CHANNEL_ID)
+        startForeground(NOTI_ID, NotificationCompat.Builder(this, NOTI_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle("측정 중")
-            .setContentText("BLE 연결 및 수집 준비")
+            .setContentText("로그인 중…")
             .setOngoing(true)
-            .build()
-        startForeground(NOTI_ID, noti)
+            .build())
 
-        // Firestore Repo / Auth 초기화
-        repo = PpgRepository(FirebaseFirestore.getInstance())
+        scope.launch {
+            val auth = FirebaseAuth.getInstance()
+            if (auth.currentUser == null) {
+                auth.signInAnonymously().await()
+            }
+            userId = FirebaseAuth.getInstance().currentUser!!.uid
 
-        val user = FirebaseAuth.getInstance().currentUser
-        if (user == null) {
-            Log.e("MeasureService", "User not logged in, stopping service")
-            stopSelf()
-            return
+            val sid = newSessionId()
+            PpgRepository.instance.setSessionId(sid)
+            sessionId = sid
+            Log.d("MeasureService","session ready -> $sid / uid=$userId")
+            // ★ 여기! 세션 메타 1회 초기화 후 BLE 시작
+            // (이 블록을 startBle() 호출 "바로 전"에 둡니다)
+            launch(Dispatchers.IO) {
+                try {
+                    PpgRepository.instance.initSessionOnce(userId, sessionId)
+                    Log.d("MeasureService", "session init OK")
+                } catch (t: Throwable) {
+                    Log.e("MeasureService", "session init FAIL", t)
+                }
+                withContext(Dispatchers.Main) {
+                    startBle()   // 이제 BLE 시작
+                }
+            }
         }
-        userId = user.uid
-
-        // 세션 ID 생성 (UTC ISO + 8자리 UUID)
-        sessionId = newSessionId()
-
-        MeasureStatusBus.setMeasuring(true)
+    }
+    // 바로 아래에 private 함수로 추가
+    private suspend fun firestoreWarmupWrite() {
+        val db = FirebaseFirestore.getInstance()
+        val uid = FirebaseAuth.getInstance().currentUser!!.uid
+        val test = db.collection("ppg_events").document(uid)
+            .collection("debug").document()
+        try {
+            withTimeout(3_000) {
+                test.set(mapOf("ping" to System.currentTimeMillis())).await()
+            }
+            Log.d("MeasureService","firestore warmup OK (${test.id})")
+        } catch (t: Throwable) {
+            Log.e("MeasureService","firestore warmup FAIL", t)
+        }
     }
 
 //    private fun parseSmoothed(line: String): Pair<Float, Float>? {
@@ -108,6 +116,28 @@ class MeasureService : Service() {
 //        val r = num("PPGf_R") ?: num("smoothedR")
 //        return if (l != null && r != null) l to r else null
 //    }
+    private fun startBle() {
+        Log.d("MeasureService","startBle() called")
+        client = PpgBleClient(
+            ctx = this,
+            onLine = { line ->
+                Log.d("MeasureService", "onLine(raw)=${line.take(160)}")
+                scope.launch(Dispatchers.IO) {
+                    val ok = try {
+                        PpgRepository.trySaveFromLine(line)
+                    } catch (t: Throwable) {
+                        Log.e("MeasureService", "trySaveFromLine threw", t)
+                        false
+                    }
+                    Log.d("MeasureService", "trySaveFromLine -> $ok")
+                    if (!ok) Log.w("MeasureService", "save skipped for line: ${line.take(160)}")
+                }
+            },
+            onError = { e -> Log.e("MeasureService", "BLE error: $e") },
+            filterByService = true
+        )
+
+    }
 
     // (A) 라인 파서 교체/추가
     private fun parseSmoothed(line: String): Pair<Float, Float>? {

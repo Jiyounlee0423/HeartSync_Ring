@@ -7,6 +7,7 @@ import com.google.firebase.firestore.*
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeout
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 
@@ -236,15 +237,32 @@ class PpgRepository(
         trySaveFromLineInternal(line)
 
     private suspend fun trySaveFromLineInternal(line: String): Boolean {
-        val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return false
-        val sid = getSessionId() ?: return false
+        Log.d("PpgRepo", "line='${line.take(160)}'")
+        val uid = FirebaseAuth.getInstance().currentUser?.uid
+        if (uid == null) {
+            Log.e("PpgRepo","EARLY-RETURN: no uid (not logged in)")
+            return false
+        }
+        val sid = getSessionId()
+        if (sid.isNullOrBlank()) {
+            Log.e("PpgRepo","EARLY-RETURN: no sessionId")
+            return false
+        }
 
         val eventType = when {
             line.startsWith("ALERT") -> "ALERT"
             line.startsWith("STAT")  -> "STAT"
-            else -> return false
+            else -> {
+                Log.w("PpgRepo","EARLY-RETURN: non STAT/ALERT")
+                return false
+            }
         }
-        val ev = parseStatLikeLine(line, eventType) ?: return false
+        val ev = parseStatLikeLine(line, eventType)
+        if (ev == null) {
+            Log.w("PpgRepo","EARLY-RETURN: parse null (maybe missing ts=?)")
+            return false
+        }
+
 
         // 실시간 그래프 즉시 반영 (세션ID 기반 절대 시각으로 통일)
         if (ev.smoothed_left != null && ev.smoothed_right != null) {
@@ -254,16 +272,54 @@ class PpgRepository(
         }
         maybeEmitAlert(ev.event, ev.side, ev.alert_type, ev.reasons, ev.ts_ms)
 
-        uploadRecord(uid, sid, ev)
-        return true
+        Log.d("PpgRepo", "about to upload (uid=$uid, sid=$sid, ts=${ev.ts_ms})")
+        try {
+            uploadRecord(uid, sid, ev)
+//            val id = withTimeout(5_000) { uploadRecord(uid, sid, ev) }   // ★ 5초 제한
+            Log.d("PpgRepo","upload OK (sid=$sid")
+            return true
+        } catch (t: Throwable) {
+            Log.e("PpgRepo","upload fail", t)
+            return false
+        }
     }
 
     /* ============================================================
      *  C) 업로드 & 최근 관측(선택)
      * ============================================================ */
     suspend fun uploadRecord(userId: String, sessionId: String, ev: PpgEvent): String {
-        ensureSessionDoc(userId, sessionId)
+//        Log.d("PpgRepo","uploadRecord ENTER (sid=$sessionId)")
+//
+//        // 1) ensureSessionDoc 단계
+//        try {
+//            withTimeout(3_000) {
+//                ensureSessionDoc(userId, sessionId)   // 내부에 .await() 있음
+//            }
+//            Log.d("PpgRepo","ensureSessionDoc DONE")
+//        } catch (t: Throwable) {
+//            Log.e("PpgRepo","ensureSessionDoc TIMEOUT/FAIL", t)
+//            throw t
+//        }
+//
+//        // 2) records set 단계
+//        val ref = recordsCol(userId, sessionId).document()
+//        Log.d("PpgRepo","set() path=ppg_events/$userId/sessions/$sessionId/records/${ref.id}")
+//
+//        val map = hashMapOf(/* ... */ "server_ts" to FieldValue.serverTimestamp())
+//        try {
+//            withTimeout(3_000) {
+//                ref.set(map).await()
+//            }
+//            Log.d("PpgRepo","set().await DONE (doc=${ref.id})")
+//        } catch (t: Throwable) {
+//            Log.e("PpgRepo","set().await TIMEOUT/FAIL", t)
+//            throw t
+//        }
+//        return ref.id
+        // 로그 분해 확인을 위해 보류
+        Log.d("PpgRepo","uploadRecord ENTER (sid=$sessionId)")
         val ref = recordsCol(userId, sessionId).document()
+        Log.d("PpgRepo","set() path=ppg_events/$userId/sessions/$sessionId/records/${ref.id}")
         val map = hashMapOf(
             "event" to ev.event,
             "host_time_iso" to ev.host_time_iso,
@@ -286,8 +342,28 @@ class PpgRepository(
             "smoothed_right" to ev.smoothed_right,
             "server_ts" to FieldValue.serverTimestamp()
         )
-        ref.set(map).await()
+        // ★ await() 제거 — 오프라인 큐에 맡김
+        ref.set(map)
+            .addOnSuccessListener { Log.d("PpgRepo", "async set OK doc=${ref.id}") }
+            .addOnFailureListener { e -> Log.e("PpgRepo", "async set FAIL", e) }
+
         return ref.id
+    }
+    suspend fun initSessionOnce(userId: String, sessionId: String) {
+        // 세션 메타는 시작 시 1회만, 넉넉한 타임아웃
+        withTimeout(10_000) {
+            db.collection("ppg_events").document(userId)
+                .collection("sessions").document(sessionId)
+                .set(
+                    mapOf(
+                        "created_at" to FieldValue.serverTimestamp(),
+                        "day" to sessionId.substring(2, 10),
+                        "id" to sessionId
+                    ),
+                    SetOptions.merge()
+                )
+                .await()
+        }
     }
 
     fun observeRecent(
@@ -409,7 +485,7 @@ class PpgRepository(
             event = eventType,
             host_time_iso = "",
             ts_ms = ts,
-            alert_type = if (eventType == "ALERT") "device" else null,
+            alert_type = if (eventType == "ALERT") "asymmetry" else null,
             reasons = null,
             AmpRatio = num("AmpRatio") { it.toDouble() },
             PAD_ms   = num("PAD")      { it.toDouble() },
@@ -434,12 +510,12 @@ class PpgRepository(
         limit: Long
     ): Flow<Pair<Float, Float>> {
         return callbackFlow {
-            val query = db.collection("users")
+            val query = db.collection("ppg_events")
                 .document(uid)
                 .collection("sessions")
                 .document(sessionId)
                 .collection("records")
-                .orderBy("ts")
+                .orderBy("ts_ms")
                 .limit(limit)
 
             val listener = query.addSnapshotListener { snap, e ->
