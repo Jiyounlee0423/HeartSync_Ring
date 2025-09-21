@@ -114,12 +114,13 @@ class PpgBleClient(
             lineBuf.delete(0, idx + 1)
             if (oneLine.isEmpty()) continue
 
-            // ★ 즉시 그래프 반영 (Firestore 저장과 독립)
-            val l = parseNumKV(oneLine, "PPGf_L") ?: parseNumKV(oneLine, "PPG_L")
-            val r = parseNumKV(oneLine, "PPGf_R") ?: parseNumKV(oneLine, "PPG_R")
-            if (l != null && r != null) {
-                PpgRepository.emitSmoothed(l, r)
-            }
+//            // ★ 즉시 그래프 반영 (Firestore 저장과 독립)
+//            val l = parseNumKV(oneLine, "PPGf_L") ?: parseNumKV(oneLine, "PPG_L")
+//            val r = parseNumKV(oneLine, "PPGf_R") ?: parseNumKV(oneLine, "PPG_R")
+//            if (l != null && r != null) {
+//                PpgRepository.emitSmoothed(l, r)
+//            }
+
 
             // 기록용 저장 (IO 스코프에서)
             if (oneLine.startsWith("STAT") || oneLine.startsWith("ALERT")) {
@@ -139,8 +140,7 @@ class PpgBleClient(
             if (oneLine.isNotEmpty()) {
                 val l = parseNumKV(oneLine, "PPGf_L") ?: parseNumKV(oneLine, "PPG_L")
                 val r = parseNumKV(oneLine, "PPGf_R") ?: parseNumKV(oneLine, "PPG_R")
-                if (l != null && r != null) PpgRepository.emitSmoothed(l, r)
-                repoScope.launch { PpgRepository.instance.trySaveFromLinePublic(oneLine) }
+                repoScope.launch { PpgRepository.trySaveFromLine(oneLine) }
                 onLine(oneLine)
             }
         }

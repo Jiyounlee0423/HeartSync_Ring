@@ -216,14 +216,15 @@ class PpgRepository(
      * ============================================================ */
     companion object {
         private val _smoothedFlow =
-            MutableSharedFlow<Pair<Float, Float>>(replay = 1, extraBufferCapacity = 256)
-        val smoothedFlow: SharedFlow<Pair<Float, Float>> = _smoothedFlow
+            MutableSharedFlow<Triple<Long, Float, Float>>(replay = 1, extraBufferCapacity = 256)
+        val smoothedFlow: SharedFlow<Triple<Long, Float, Float>> = _smoothedFlow
 
         /** 앱 전역 싱글톤 */
         val instance: PpgRepository by lazy { PpgRepository(FirebaseFirestore.getInstance()) }
 
-        fun emitSmoothed(left: Number, right: Number) {
-            _smoothedFlow.tryEmit(left.toFloat() to right.toFloat())
+        /** 서비스/BLE → UI로 즉시 전달 (절대시각 포함) */
+        fun emitSmoothed(timeMillis: Long, left: Number, right: Number) {
+            _smoothedFlow.tryEmit(Triple(timeMillis, left.toFloat(), right.toFloat()))
         }
 
         suspend fun trySaveFromLine(line: String): Boolean =
@@ -245,8 +246,11 @@ class PpgRepository(
         }
         val ev = parseStatLikeLine(line, eventType) ?: return false
 
+        // 실시간 그래프 즉시 반영 (세션ID 기반 절대 시각으로 통일)
         if (ev.smoothed_left != null && ev.smoothed_right != null) {
-            emitSmoothed(ev.smoothed_left!!, ev.smoothed_right!!)
+            val base = sessionIdBaseEpochMs(sid) // "S_yyyyMMdd_HHmmss" or ISO 변형
+            val absTs = if (base > 0L) base + ev.ts_ms else System.currentTimeMillis()
+            emitSmoothed(absTs, ev.smoothed_left!!, ev.smoothed_right!!)
         }
         maybeEmitAlert(ev.event, ev.side, ev.alert_type, ev.reasons, ev.ts_ms)
 

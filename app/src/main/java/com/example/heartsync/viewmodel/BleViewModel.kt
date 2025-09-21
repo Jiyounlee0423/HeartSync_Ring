@@ -43,8 +43,9 @@ class BleViewModel(
 
     init {
         // BLE/서비스에서 바로 쏘는 실시간 smoothed 값 반영
+        // BLE → UI 실시간 smoothed 반영 (time, L, R)
         PpgRepository.smoothedFlow
-            .onEach { (l, r) ->
+            .onEach { (_, l, r) ->
                 _graphState.update { p ->
                     p.copy(
                         smoothedL = (p.smoothedL + l).takeLast(MAX_GRAPH_POINTS),

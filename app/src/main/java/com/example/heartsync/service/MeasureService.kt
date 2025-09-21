@@ -137,10 +137,9 @@ class MeasureService : Service() {
             ctx = this,
             onLine = { line ->
                 scope.launch(Dispatchers.IO) {
-                    handleLine(line)
-                    parseSmoothed(line)?.let { (l, r) ->
-                        com.example.heartsync.data.remote.PpgRepository.emitSmoothed(l, r)
-                    }
+                    // 한 번의 호출로: 파싱 → (absTs 계산) emit → Firestore 저장
+                    com.example.heartsync.data.remote.PpgRepository.trySaveFromLine(line)
+                    // handleLine(line) 에서 추가 저장/업로드를 하고 있었다면 중복 저장 방지를 위해 정리
                 }
             },
             onError = { e ->
@@ -223,7 +222,11 @@ class MeasureService : Service() {
             val outL = emaL!!
             val outR = emaR!!
             Log.d("MSVC", "graph emit L=$outL R=$outR (src ampL=$lSrc ampR=$rSrc)")
-            PpgRepository.emitSmoothed(outL, outR)  // ★ 여기서 홈 그래프 파이프라인으로 보냄
+            PpgRepository.emitSmoothed(
+                System.currentTimeMillis(), // 그래프/Firestore 기록용 timestamp
+                outL,
+                outR
+            )
         } else {
             Log.w("MSVC", "no L/R source (ampL/ampR/BPM_L/BPM_R 없음)")
         }

@@ -234,8 +234,8 @@ class HomeViewModel(
                     .collectLatest { _today.value = it }
             }
             viewModelScope.launch {
-                PpgRepository.smoothedFlow.collect { (l, r) ->
-                    addLivePoint(l, r)
+                PpgRepository.smoothedFlow.collect { (t, l, r) ->
+                    addLivePoint(t, l, r)
                 }
             }
         }
@@ -245,9 +245,8 @@ class HomeViewModel(
         if (!connected) _live.value = emptyList()
     }
 
-    private fun addLivePoint(l: Float, r: Float) {
-        val now = System.currentTimeMillis()
-        val newPt = PpgPoint(now, l.toDouble(), r.toDouble(), now)
+    private fun addLivePoint(timeMillis: Long, l: Float, r: Float) {
+        val newPt = PpgPoint(timeMillis, l.toDouble(), r.toDouble(), timeMillis)
         _live.update { cur -> (if (cur.size >= 1000) cur.drop(cur.size - 999) else cur) + newPt }
     }
 }
