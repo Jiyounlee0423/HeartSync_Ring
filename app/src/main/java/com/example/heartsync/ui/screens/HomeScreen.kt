@@ -11,6 +11,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -31,6 +32,15 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.time.LocalDate
 import java.util.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 
 // --------------------------- Screen ---------------------------
 
@@ -110,26 +120,17 @@ fun HomeScreen(
             val last = pointsDisplay.lastOrNull()
             val sourceLabel = if (live.isNotEmpty() && isConnected) "실시간(BLE)" else "기록(Firebase)"
 
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("샘플 수: ${pointsDisplay.size}", modifier = Modifier.weight(1f))
-                Text(
-                    sourceLabel,
-                    modifier = Modifier.weight(1f),
-                    textAlign = TextAlign.Center,
-                    style = MaterialTheme.typography.labelLarge
-                )
-                Text(
-                    "최근 L/R: " +
-                            "${last?.left?.let { "%.2f".format(it) } ?: "-"} / " +
-                            "${last?.right?.let { "%.2f".format(it) } ?: "-"}",
-                    modifier = Modifier.weight(1f),
-                    textAlign = TextAlign.End
-                )
+            val twoLineMinHeight = with(LocalDensity.current) {
+                // bodyMedium의 lineHeight × 2줄 × 여유계수(1.1~1.2)
+                (MaterialTheme.typography.bodyMedium.lineHeight * 2f * 1.15f).toDp()
             }
+
+            HeaderRow(
+                pointsDisplaySize = pointsDisplay.size,
+                sourceLabel = sourceLabel,
+                lastLeft = last?.left,
+                lastRight = last?.right
+            )
 
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf(100, 150, 200).forEach { w ->
@@ -182,6 +183,73 @@ fun HomeScreen(
             confirmButton = {
                 TextButton(onClick = { currentAlert = null }) { Text("확인") }
             }
+        )
+    }
+}
+
+@Composable
+fun HeaderRow(
+    pointsDisplaySize: Int,
+    sourceLabel: String,
+    lastLeft: Double?,
+    lastRight: Double?
+) {
+    val density = LocalDensity.current
+
+    // 2줄 기준 최소 높이(Dp) 계산: bodyMedium lineHeight × 2줄 × 여유계수
+    val twoLineMinHeight = with(density) {
+        (MaterialTheme.typography.bodyMedium.lineHeight.value * 2f * 1.15f).sp.toDp()
+    }
+    // 마지막 Text의 라인 간격(원하는 값으로 살짝 여유를 줌)
+    val compactLineHeight = (MaterialTheme.typography.bodyMedium.lineHeight.value * 1.2f).sp
+
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = twoLineMinHeight),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // 좌측: 샘플 수 (1줄 고정)
+        Text(
+            text = "샘플 수: $pointsDisplaySize",
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.bodyMedium
+        )
+
+        // 중앙: 소스 라벨 (1줄 고정)
+        Text(
+            text = sourceLabel,
+            modifier = Modifier.weight(1f),
+            textAlign = TextAlign.Center,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.labelLarge
+        )
+
+        // 우측: 항상 2줄(제목/값) 고정
+        Text(
+            text = buildAnnotatedString {
+                append("최근 L/R:")
+                append('\n')
+                append(
+                    "${lastLeft?.let { "%.2f".format(it) } ?: "-"} / " +
+                            "${lastRight?.let { "%.2f".format(it) } ?: "-"}"
+                )
+            },
+            modifier = Modifier.weight(1f),
+            textAlign = TextAlign.End,
+            minLines = 2,
+            maxLines = 2,           // 정확히 2줄
+            softWrap = true,
+            overflow = TextOverflow.Clip,
+            style = MaterialTheme.typography.bodyMedium.merge(
+                TextStyle(lineHeight = compactLineHeight)
+            )
         )
     }
 }

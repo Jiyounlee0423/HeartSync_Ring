@@ -11,6 +11,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.heartsync.ui.screens.model.NotiLogSection
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -22,6 +25,10 @@ fun NotiLogScreen(
 
     var datePickerOpen by remember { mutableStateOf(false) }
 
+    // ↓↓↓ 다이얼로그 안/밖 어디서나 접근할 수 있도록 바깥에 선언
+    val zone = remember { ZoneId.systemDefault() }
+    val dateState = rememberDatePickerState() // 필요하면 initialSelectedDateMillis로 현재 선택일 세팅 가능
+
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(
@@ -29,7 +36,10 @@ fun NotiLogScreen(
                 style = MaterialTheme.typography.headlineSmall,
                 modifier = Modifier.weight(1f)
             )
-            OutlinedButton(onClick = { datePickerOpen = true }) {
+            OutlinedButton(onClick = {
+                // 열 때마다 이전 선택을 유지하고 싶다면 여기에서 초기값 세팅해도 됨
+                datePickerOpen = true
+            }) {
                 Text("날짜 선택")
             }
         }
@@ -52,7 +62,7 @@ fun NotiLogScreen(
                     items(section.rows, key = { it.id }) { row ->
                         ElevatedCard(Modifier.fillMaxWidth()) {
                             Column(Modifier.padding(16.dp)) {
-                                val timeStr = row.localTimeStr(java.time.ZoneId.systemDefault())
+                                val timeStr = row.localTimeStr(ZoneId.systemDefault())
                                 val reasons = if (row.reasons.isNotEmpty())
                                     row.reasons.joinToString(", ")
                                 else "이유 미지정"
@@ -78,18 +88,21 @@ fun NotiLogScreen(
             onDismissRequest = { datePickerOpen = false },
             confirmButton = {
                 TextButton(onClick = {
-                    // 선택값 적용
-                    // m3 DatePicker는 millis -> LocalDate 변환 필요
-                    // 아래 helper 참고
-                    // 이 블록 안에서 selectedMillis 읽어서 vm.setDate(...)
+                    // 선택된 millis → LocalDate 변환 후 ViewModel에 적용
+                    val millis = dateState.selectedDateMillis
+                    if (millis != null) {
+                        val picked: LocalDate =
+                            Instant.ofEpochMilli(millis).atZone(zone).toLocalDate()
+                        vm.setDate(picked)   // ← ViewModel에서 이 날짜로 섹션을 갱신하도록 구현되어 있어야 함
+                    }
+                    datePickerOpen = false
                 }) { Text("확인") }
             },
-            dismissButton = { TextButton(onClick = { datePickerOpen = false }) { Text("취소") } }
+            dismissButton = {
+                TextButton(onClick = { datePickerOpen = false }) { Text("취소") }
+            }
         ) {
-            val state = rememberDatePickerState()
-            DatePicker(state = state)
-            // 확인 버튼에서:
-            // state.selectedDateMillis?.let { vm.setDate(Instant.ofEpochMilli(it).atZone(ZoneId.systemDefault()).toLocalDate()) }
+            DatePicker(state = dateState)
         }
     }
 }
