@@ -456,6 +456,23 @@ class PpgRepository(
         return null
     }
 
+    // PpgRepository.kt (class PpgRepository 안)
+    fun putSessionMetaFireAndForget(uid: String, sid: String) {
+        db.collection("ppg_events").document(uid)
+            .collection("sessions").document(sid)
+            .set(
+                mapOf(
+                    "created_at" to FieldValue.serverTimestamp(),
+                    "day" to sid.substring(2, 10),
+                    "id" to sid,
+                    "ownerUid" to uid
+                ),
+                SetOptions.merge()
+            )
+            .addOnSuccessListener { Log.d("PpgRepo","SESSION META OK /ppg_events/$uid/sessions/$sid") }
+            .addOnFailureListener { e -> Log.w("PpgRepo","SESSION META ERR", e) }
+    }
+
     private suspend fun ensureSessionDoc(uid: String, sessionId: String) {
         val day = sessionId.substring(2, 10) // "S_yyyyMMdd_HHmmss_..." -> yyyyMMdd
         val meta = mapOf(

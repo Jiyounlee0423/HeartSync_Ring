@@ -67,45 +67,61 @@ class MeasureService : Service() {
             .build())
 
         scope.launch {
-            val auth = FirebaseAuth.getInstance()
-            if (auth.currentUser == null) {
-                auth.signInAnonymously().await()
-            }
-            userId = FirebaseAuth.getInstance().currentUser!!.uid
-
-            val sid = newSessionId()
-            PpgRepository.instance.setSessionId(sid)
-            sessionId = sid
-            Log.d("MeasureService","session ready -> $sid / uid=$userId")
-            // ★ 여기! 세션 메타 1회 초기화 후 BLE 시작
-            // (이 블록을 startBle() 호출 "바로 전"에 둡니다)
-            launch(Dispatchers.IO) {
-                try {
-                    PpgRepository.instance.initSessionOnce(userId, sessionId)
-                    Log.d("MeasureService", "session init OK")
-                } catch (t: Throwable) {
-                    Log.e("MeasureService", "session init FAIL", t)
-                }
-                withContext(Dispatchers.Main) {
-                    startBle()   // 이제 BLE 시작
-                }
-            }
+//            val auth = FirebaseAuth.getInstance()
+//            if (auth.currentUser == null) {
+//                auth.signInAnonymously().await()
+//            }
+//            userId = FirebaseAuth.getInstance().currentUser!!.uid
+//
+//            val sid = newSessionId()
+//            PpgRepository.instance.setSessionId(sid)
+//            sessionId = sid
+//            Log.d("MeasureService","session ready -> $sid / uid=$userId")
+//            // ★ 여기! 세션 메타 1회 초기화 후 BLE 시작
+//            // (이 블록을 startBle() 호출 "바로 전"에 둡니다)
+//            launch(Dispatchers.IO) {
+//                try {
+//                    PpgRepository.instance.initSessionOnce(userId, sessionId)
+//                    Log.d("MeasureService", "session init OK")
+//                } catch (t: Throwable) {
+//                    Log.e("MeasureService", "session init FAIL", t)
+//                }
+//                withContext(Dispatchers.Main) {
+//                    startBle()   // 이제 BLE 시작
+//                }
+//            }
         }
     }
     // 바로 아래에 private 함수로 추가
     private suspend fun firestoreWarmupWrite() {
         val db = FirebaseFirestore.getInstance()
         val uid = FirebaseAuth.getInstance().currentUser!!.uid
-        val test = db.collection("ppg_events").document(uid)
+        db.collection("ppg_events").document(uid)
             .collection("debug").document()
-        try {
-            withTimeout(3_000) {
-                test.set(mapOf("ping" to System.currentTimeMillis())).await()
+            .set(mapOf("ping" to System.currentTimeMillis()))
+            .addOnSuccessListener { Log.d("MeasureService","firestore warmup OK") }
+            .addOnFailureListener { Log.w("MeasureService","firestore warmup err", it) }
+        // ❌ withTimeout/await 제거 (네트워크 지연으로 타임아웃 나던 부분)
+    }
+
+    private fun initSessionOnce_fireAndForget(uid: String, sessionId: String) {
+        FirebaseFirestore.getInstance()
+            .collection("ppg_events").document(uid)
+            .collection("sessions").document(sessionId)
+            .set(
+                mapOf(
+                    "created_at" to com.google.firebase.firestore.FieldValue.serverTimestamp(),
+                    "day" to sessionId.substring(2, 10),
+                    "id"  to sessionId
+                ),
+                com.google.firebase.firestore.SetOptions.merge()
+            )
+            .addOnSuccessListener {
+                Log.d("MeasureService","SESSION META OK => /ppg_events/$uid/sessions/$sessionId")
             }
-            Log.d("MeasureService","firestore warmup OK (${test.id})")
-        } catch (t: Throwable) {
-            Log.e("MeasureService","firestore warmup FAIL", t)
-        }
+            .addOnFailureListener { e ->
+                Log.w("MeasureService","SESSION META ERR", e)
+            }
     }
 
 //    private fun parseSmoothed(line: String): Pair<Float, Float>? {
@@ -119,22 +135,19 @@ class MeasureService : Service() {
     private fun startBle() {
         Log.d("MeasureService","startBle() called")
         client = PpgBleClient(
-            ctx = this,
+            ctx = this@MeasureService,
             onLine = { line ->
-                Log.d("MeasureService", "onLine(raw)=${line.take(160)}")
+                Log.d("MeasureService", "LINE IN => ${line.take(160)}") // ★ 반드시 찍힘
                 scope.launch(Dispatchers.IO) {
-                    val ok = try {
-                        PpgRepository.trySaveFromLine(line)
-                    } catch (t: Throwable) {
-                        Log.e("MeasureService", "trySaveFromLine threw", t)
-                        false
-                    }
-                    Log.d("MeasureService", "trySaveFromLine -> $ok")
-                    if (!ok) Log.w("MeasureService", "save skipped for line: ${line.take(160)}")
+                    maybeRotateSessionIfNeeded()
+                    val ok = PpgRepository.trySaveFromLine(line)
+                    Log.d("MeasureService", "SAVE RESULT => $ok")        // ★ 저장 시도 결과
+                    if (!ok) Log.w("MeasureService","save skipped: ${line.take(160)}")
                 }
             },
-            onError = { e -> Log.e("MeasureService", "BLE error: $e") },
-            filterByService = true
+            onError = { e -> Log.e("MeasureService","BLE error: $e") },
+            filterByService = false
+
         )
 
     }
@@ -157,43 +170,93 @@ class MeasureService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val devName = intent?.getStringExtra(EXTRA_DEVICE_NAME)
         val devAddr = intent?.getStringExtra(EXTRA_DEVICE_ADDR)
-
         if (devAddr.isNullOrEmpty()) {
-            stopSelf()
-            return START_NOT_STICKY
+            stopSelf(); return START_NOT_STICKY
         }
-
-        client = PpgBleClient(
-            ctx = this,
-            onLine = { line ->
-                scope.launch(Dispatchers.IO) {
-                    // 한 번의 호출로: 파싱 → (absTs 계산) emit → Firestore 저장
-                    com.example.heartsync.data.remote.PpgRepository.trySaveFromLine(line)
-                    // handleLine(line) 에서 추가 저장/업로드를 하고 있었다면 중복 저장 방지를 위해 정리
-                }
-            },
-            onError = { e ->
-                Log.e("MeasureService", "BLE error: $e")
-            },
-            filterByService = true
-        )
-
-        // 연결 시도
-        client.connect(BleDevice(devName, devAddr))
-
-        // 연결 상태에 따라 알림 텍스트 업데이트
         scope.launch {
-            client.connectionState.collect { st ->
-                val connected = st is PpgBleClient.ConnectionState.Connected
-                MeasureStatusBus.setConnected(connected)
 
-                // ★ 삭제: requestMtu/enableNotify/writeCommand 호출 (PpgBleClient 내부에서 수행)
+
+            // 1) 로그인 보장
+            val auth = FirebaseAuth.getInstance()
+            val cur = auth.currentUser
+            if (cur == null /* || cur.isAnonymous */) {
+                Log.e("MeasureService","로그인 필요"); stopSelf(); return@launch
+            }
+            userId = cur.uid
+
+            // 2) (선택) 워밍업 쓰기로 네트워크/오프라인큐 준비
+            withContext(Dispatchers.IO) { firestoreWarmupWrite() }
+
+            // 3) 세션 회전/생성 + 세션 메타 초기화 "완료될 때까지 기다림"
+            withContext(Dispatchers.IO) { maybeRotateSessionIfNeeded() }
+            val sid = sessionId
+            Log.d("MeasureService","SESSION READY uid=$userId sid=$sid")
+
+            // onStartCommand() 안, SESSION READY 직후
+            val db = FirebaseFirestore.getInstance()
+            val testRef = db.collection("ppg_events").document(userId)
+                .collection("sessions").document(sessionId)
+                .collection("records").document()
+
+            testRef.set(
+                mapOf(
+                    "event" to "STAT",
+                    "ts_ms" to System.currentTimeMillis() % 1000,
+                    "smoothed_left" to 1.23,
+                    "smoothed_right" to 4.56,
+                    "server_ts" to com.google.firebase.firestore.FieldValue.serverTimestamp()
+                )
+            ).addOnSuccessListener {
+                Log.d("MeasureService", "TEST WRITE OK => ${testRef.path}")
+            }.addOnFailureListener { e ->
+                Log.e("MeasureService", "TEST WRITE FAIL", e)
+            }
+
+            // 4) 세션 준비가 끝난 뒤에만 BLE 시작
+            client = PpgBleClient(
+                ctx = this@MeasureService,
+                onLine = { line ->
+                    Log.d("MeasureService", "LINE IN => ${line.take(160)}") // ★ 반드시 찍힘
+                    scope.launch(Dispatchers.IO) {
+                        maybeRotateSessionIfNeeded()
+                        val ok = PpgRepository.trySaveFromLine(line)
+                        Log.d("MeasureService", "SAVE RESULT => $ok")        // ★ 저장 시도 결과
+                        if (!ok) Log.w("MeasureService","save skipped: ${line.take(160)}")
+                    }
+                },
+                onError = { e -> Log.e("MeasureService","BLE error: $e") },
+                filterByService = true
+            )
+            client.connect(BleDevice(devName, devAddr))
+
+            Log.d("MeasureService", "CONNECT TRY name=$devName addr=$devAddr")
+
+            // 5) 상태 알림
+            client.connectionState.collect { st ->
+                Log.d("MeasureService", "BLE STATE => $st") // ★ 상태 덤프
+                if (st is PpgBleClient.ConnectionState.Disconnected ||
+                    st is PpgBleClient.ConnectionState.Failed) {
+                    // 짧게 재시도 (필요 시 backoff)
+                    kotlinx.coroutines.delay(1200)
+                    withContext(Dispatchers.Main) {
+                        Log.d("MeasureService", "RETRY connect addr=$devAddr")
+                        client.connect(BleDevice(devName, devAddr))
+                    }
+                }
                 val text = when (st) {
                     is PpgBleClient.ConnectionState.Connected  -> "연결됨: ${st.device.address}"
                     is PpgBleClient.ConnectionState.Connecting -> "연결 중…"
                     is PpgBleClient.ConnectionState.Failed     -> "실패: ${st.reason}"
                     else -> "대기"
                 }
+                when (st) {
+                is PpgBleClient.ConnectionState.Failed -> {
+                    Log.e("MeasureService", "BLE FAIL reason=${st.reason}")
+                }
+                    else -> {
+                    }
+
+            }
                 val n = NotificationCompat.Builder(this@MeasureService, NOTI_CHANNEL_ID)
                     .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
                     .setContentTitle("측정 중")
@@ -203,6 +266,10 @@ class MeasureService : Service() {
                 startForeground(NOTI_ID, n)
             }
         }
+
+
+
+
 
         return START_STICKY
     }
@@ -346,5 +413,35 @@ class MeasureService : Service() {
         if (s.isNullOrBlank()) return null
         val list = s.split(";").map { it.trim() }.filter { it.isNotEmpty() }
         return if (list.isEmpty()) null else list
+    }
+
+    private fun dayFromSessionId(id: String): String? =
+        Regex("""^S_(\d{8})_""").find(id)?.groupValues?.getOrNull(1)
+
+    private fun todaySeoul(): String =
+        java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Seoul"))
+            .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"))
+
+    private suspend fun startNewSessionAndInit() {
+        val sid = newSessionId()
+        PpgRepository.instance.setSessionId(sid)
+        sessionId = sid
+        val uid = FirebaseAuth.getInstance().currentUser!!.uid
+
+        // ✅ 부모 세션 문서 먼저 생성 (BLE 시작/레코드 쓰기 전에)
+        PpgRepository.instance.putSessionMetaFireAndForget(uid, sid)
+        // 또는 규칙상 필요하면: withTimeout(30_000) { PpgRepository.instance.initSessionOnce(uid, sid) }
+
+        Log.d("MeasureService","SESSION READY uid=$uid sid=$sid")
+    }
+
+    private suspend fun maybeRotateSessionIfNeeded() {
+        val cur = sessionId
+        val curDay = dayFromSessionId(cur)
+        val today = todaySeoul()
+        if (cur.isBlank() || curDay != today) {
+            Log.d("MeasureService", "rotate session: cur=$cur (day=$curDay) -> today=$today")
+            startNewSessionAndInit()
+        }
     }
 }
