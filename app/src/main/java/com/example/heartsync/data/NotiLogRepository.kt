@@ -1,74 +1,71 @@
-// app/src/main/java/com/example/heartsync/ui/screens/NotiLogRepository.kt
-package com.example.heartsync.ui.screens
+// app/src/main/java/com/example/heartsync/data/NotiLogRepository.kt
+package com.example.heartsync.data
 
 import android.util.Log
 import com.example.heartsync.ui.screens.model.NotiLogRow
-import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.Timestamp
+import com.google.firebase.firestore.FieldPath
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.Query
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import java.time.Instant
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 
 class NotiLogRepository(
-    private val db: FirebaseFirestore,
-    private val auth: FirebaseAuth
+    private val db: FirebaseFirestore
 ) {
     companion object { private const val TAG = "NotiLogRepository" }
 
     /**
-     * collectionGroup("records")에서 현재 사용자(ownerUid 또는 uid) + ALERT 만 수집
-     * - 스키마 호환: eventType 또는 event 둘 다 지원
-     * - hostIso 없는 문서는 server_ts 로 ISO 문자열 생성
-     * - AmpRatio, PAD, dSUT 키 혼용 대응 (PAD_ms, dSUT_ms 포함)
+     * 지정한 날짜(yyyyMMdd)의 세션들을 찾고, 각 세션의 records를 리슨하면서
+     * event == "ALERT"(또는 eventType == "ALERT")인 문서만 NotiLogRow로 변환해 합칩니다.
+     * collectionGroup 인덱스/권한 이슈를 우회합니다.
      */
-    fun observeAlertRows(limit: Long = 500): Flow<List<NotiLogRow>> = callbackFlow {
-        val uid = auth.currentUser?.uid
-        if (uid == null) {
-            Log.w(TAG, "observeAlertRows: no auth uid")
-            trySend(emptyList())
-            close(); return@callbackFlow
-        }
+    fun observeAlertRowsForDate(uid: String, date: LocalDate): Flow<List<NotiLogRow>> = callbackFlow {
+        val ymd = date.format(DateTimeFormatter.BASIC_ISO_DATE) // yyyyMMdd
+        val sessionsCol = db.collection("ppg_events").document(uid).collection("sessions")
 
-        val base = db.collectionGroup("records")
+        // 1) day 필드로 우선 리슨
+        val qByDay = sessionsCol.whereEqualTo("day", ymd)
 
-        // ownerUid/uid 어느 필드가 저장되었는지에 따라 둘 다 시도
-        // (둘 다 저장했다면 ownerUid 쿼리로 충분)
-        val qEventType = base
-            .whereEqualTo("ownerUid", uid)
-            .whereEqualTo("eventType", "ALERT")
-            .limit(limit)
+        // 2) 보조: 문서 ID prefix로 폴백 (S_yyyyMMdd_…)
+        val idPrefix = "S_${ymd}"
+        val qByIdPrefix = sessionsCol
+            .whereGreaterThanOrEqualTo(FieldPath.documentId(), idPrefix)
+            .whereLessThan(FieldPath.documentId(), idPrefix + "\uf8ff")
+            .orderBy(FieldPath.documentId(), Query.Direction.ASCENDING)
 
-        val qEvent = base
-            .whereEqualTo("ownerUid", uid)
-            .whereEqualTo("event", "ALERT")
-            .limit(limit)
+        val recordRegs: MutableMap<String, ListenerRegistration> = mutableMapOf()
+        val rowsBySession: MutableMap<String, List<NotiLogRow>> = mutableMapOf()
 
-        var cache1: List<NotiLogRow> = emptyList()
-        var cache2: List<NotiLogRow> = emptyList()
+        // 로컬 헬퍼: Firestore 문서를 NotiLogRow로 변환 (ALERT 외는 null)
+        fun toRow(id: String, data: Map<String, Any?>): NotiLogRow? {
+            val event = (data["event"] as? String) ?: (data["eventType"] as? String)
+            if (!"ALERT".equals(event, ignoreCase = true)) return null
 
-        fun toRow(id: String, data: Map<String, Any?>?): NotiLogRow? {
-            if (data == null) return null
-
-            // hostIso 우선, 없으면 host_time_iso, 그것도 없으면 server_ts 로 보정
-            val hostIso = when (val v = data["hostIso"] ?: data["host_time_iso"]) {
-                is String -> v
-                else -> {
-                    val ts = (data["server_ts"] as? com.google.firebase.Timestamp)?.toDate()?.time
-                    if (ts != null) Instant.ofEpochMilli(ts).toString() else ""
-                }
-            }
+            val hostIso: String =
+                (data["hostIso"] as? String)
+                    ?: (data["host_time_iso"] as? String)
+                    ?: ((data["server_ts"] as? Timestamp)
+                        ?.toDate()
+                        ?.time
+                        ?.let { Instant.ofEpochMilli(it).toString() }
+                        ?: "")
 
             val reasons: List<String> = when (val r = data["reasons"]) {
                 is List<*> -> r.mapNotNull { it?.toString()?.trim() }.filter { it.isNotEmpty() }
                 is String  -> r.split(',', ';', '|', '、', '；').map { it.trim() }.filter { it.isNotEmpty() }
-                else -> emptyList()
+                else       -> emptyList()
             }
 
             fun num(name: String): Double? = when (val v = data[name]) {
                 is Number -> v.toDouble()
                 is String -> v.toDoubleOrNull()
-                else -> null
+                else      -> null
             }
 
             return NotiLogRow(
@@ -76,29 +73,83 @@ class NotiLogRepository(
                 hostIso = hostIso,
                 reasons = reasons,
                 ampRatio = num("AmpRatio"),
-                padMs = num("PAD") ?: num("PAD_ms"),
-                dSutMs = num("dSUT") ?: num("dSUT_ms")
+                padMs    = num("PAD") ?: num("PAD_ms"),
+                dSutMs   = num("dSUT") ?: num("dSUT_ms")
             )
         }
 
         fun emitMerged() {
-            val merged = (cache1 + cache2)
+            val merged = rowsBySession.values
+                .flatten()
                 .distinctBy { it.id }
-                .sortedByDescending { it.instantOrNull() }  // 최신 먼저
+                .sortedByDescending { it.instantOrNull() }
+            Log.d(TAG, "emitMerged(date=$ymd) count=${merged.size}")
             trySend(merged)
         }
 
-        val r1 = qEventType.addSnapshotListener { snap, e ->
-            if (e != null) { Log.w(TAG, "qEventType err", e); trySend(emptyList()); return@addSnapshotListener }
-            cache1 = snap?.documents.orEmpty().mapNotNull { toRow(it.id, it.data) }
-            emitMerged()
-        }
-        val r2 = qEvent.addSnapshotListener { snap, e ->
-            if (e != null) { Log.w(TAG, "qEvent err", e); trySend(emptyList()); return@addSnapshotListener }
-            cache2 = snap?.documents.orEmpty().mapNotNull { toRow(it.id, it.data) }
-            emitMerged()
+        fun clearRecordListeners(keep: Set<String>) {
+            (recordRegs.keys - keep).forEach { sid ->
+                recordRegs.remove(sid)?.remove()
+                rowsBySession.remove(sid)
+            }
         }
 
-        awaitClose { r1.remove(); r2.remove() }
+        fun attachRecordListener(sid: String) {
+            if (recordRegs.containsKey(sid)) return
+            val reg = sessionsCol.document(sid).collection("records")
+                .addSnapshotListener { recSnap, recErr ->
+                    if (recErr != null) {
+                        Log.w(TAG, "records($sid) err", recErr)
+                        rowsBySession[sid] = emptyList()
+                        emitMerged()
+                        return@addSnapshotListener
+                    }
+                    val rows: List<NotiLogRow> = recSnap?.documents.orEmpty().mapNotNull { d ->
+                        d.data?.let { toRow(d.id, it) }
+                    }
+                    rowsBySession[sid] = rows
+                    emitMerged()
+                }
+            recordRegs[sid] = reg
+        }
+
+        var usingDay = true
+        var sessionReg: ListenerRegistration? = null
+
+        fun startListening(q: Query) {
+            sessionReg?.remove()
+            sessionReg = q.addSnapshotListener { ss, se ->
+                if (se != null) {
+                    Log.w(TAG, "session listen err usingDay=$usingDay", se)
+                    // day 쿼리 실패/빈 결과 → prefix 쿼리로 폴백
+                    if (usingDay) {
+                        usingDay = false
+                        startListening(qByIdPrefix)
+                    } else {
+                        trySend(emptyList())
+                    }
+                    return@addSnapshotListener
+                }
+
+                val ids: Set<String> = ss?.documents?.map { it.id }?.toSet().orEmpty()
+                clearRecordListeners(ids)
+                ids.forEach(::attachRecordListener)
+
+                // day 쿼리 결과가 0이면 즉시 prefix로 폴백
+                if (usingDay && ids.isEmpty()) {
+                    usingDay = false
+                    startListening(qByIdPrefix)
+                }
+            }
+        }
+
+        startListening(qByDay)
+
+        awaitClose {
+            sessionReg?.remove()
+            recordRegs.values.forEach { it.remove() }
+            recordRegs.clear()
+            rowsBySession.clear()
+        }
     }
 }
