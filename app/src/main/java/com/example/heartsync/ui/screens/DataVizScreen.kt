@@ -1,129 +1,146 @@
 // app/src/main/java/com/example/heartsync/ui/screens/DataVizScreen.kt
 package com.example.heartsync.ui.screens
 
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Text
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
-
-// Compose 그래픽 타입을 alias로 명시
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path as ComposePath
-import androidx.compose.ui.geometry.Offset as ComposeOffset
-import androidx.compose.ui.graphics.drawscope.Stroke
-
 import com.example.heartsync.ui.DataBizViewModel
+import com.example.heartsync.ui.model.DayMetrics
+import com.example.heartsync.ui.model.MetricStat
+import com.google.firebase.auth.FirebaseAuth
+import android.util.Log
+import androidx.compose.foundation.lazy.LazyColumn
+import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DataVizScreen(
-    deviceId: String,                         // 예: "fpb8XE0z2ifrQJGV4liKw31grQR2"
-    vm: DataBizViewModel = viewModel(),       // 이전에 만든 ViewModel 재사용
+    deviceId: String, // 기존 파라미터는 유지
+    vm: DataBizViewModel = viewModel(),
 ) {
-    if (deviceId.isNullOrBlank()) {
+    // ✅ 여기서 **반드시 uid**를 꺼내 쓴다
+    val uid = remember { FirebaseAuth.getInstance().currentUser?.uid.orEmpty() }
+
+
+    if (uid.isBlank()) {
         Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("장치가 선택되지 않았습니다.")
-            Text("MainActivity에서 deviceId를 넘겨주세요.")
+            Text("로그인이 필요합니다.")
         }
         return
     }
-    val points by vm.points.collectAsState()
 
-    // 같은 날짜(Asia/Seoul)의 모든 세션 records 합쳐서 실시간 구독
-    LaunchedEffect(deviceId) {
-        vm.startListenSameDateSessions(
-            deviceId = deviceId,
-            date      = LocalDate.now(ZoneId.of("Asia/Seoul")),
-            tsField   = "timestamp",
-            leftField = "smooted_left",
-            rightField= "smooted_right"
+    val seoul = remember { ZoneId.of("Asia/Seoul") }
+    var selectedDate by remember { mutableStateOf(LocalDate.now(seoul)) }
+    val df = remember { DateTimeFormatter.ofPattern("yyyy-MM-dd (E)") }
+
+    val dayMetrics by vm.dayMetrics.collectAsState()
+    var showPicker by remember { mutableStateOf(false) }
+
+    // ✅ 디버그: 현재 선택 날짜/uid 확인
+    LaunchedEffect(uid, selectedDate) {
+        Log.d("DataViz", "ENTER screen, uid=$uid, date=$selectedDate")
+        Log.d("DataViz", "startListenDayMetrics uid=$uid date=${selectedDate} prefix=S_${selectedDate.format(DateTimeFormatter.BASIC_ISO_DATE)}")
+        vm.startListenDayMetrics(
+            uid = uid,   // ← 여기 중요! uid로 전달
+            date = selectedDate,
+            ampField = "AmpRatio",
+            padField = "PAD_ms",
+            dSutField = "dSUT_ms\n"
         )
     }
     DisposableEffect(Unit) { onDispose { vm.stopAll() } }
 
-    // === Column 안에 그래프/텍스트 배치 ===
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+        modifier = Modifier.fillMaxSize().padding(16.dp)
     ) {
-        Text("센서 데이터 시각화", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(12.dp))
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("날짜별 통계", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+            TextButton(onClick = { showPicker = true }) { Text(selectedDate.format(df)) }
+        }
 
-        // 그래프 영역 (Column 안)
-        LineChart(
-            dataLeft  = points.map { it.t to it.left.toFloat() },
-            dataRight = points.map { it.t to it.right.toFloat() },
-            modifier  = Modifier
-                .fillMaxWidth()
-                .height(260.dp)
-        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = { selectedDate = selectedDate.minusDays(1) }, modifier = Modifier.weight(1f)) { Text("이전 날") }
+            OutlinedButton(onClick = { selectedDate = selectedDate.plusDays(1) },  modifier = Modifier.weight(1f)) { Text("다음 날") }
+        }
 
+        if (showPicker) {
+            DatePickerDialog(onDismissRequest = { showPicker = false },
+                confirmButton = {
+                    TextButton(onClick = {
+                        vm.datePickerState.selectedDateMillis?.let { millis ->
+                            selectedDate = Instant.ofEpochMilli(millis).atZone(seoul).toLocalDate()
+                        }
+                        showPicker = false
+                    }) { Text("선택") }
+                },
+                dismissButton = { TextButton(onClick = { showPicker = false }) { Text("취소") } }
+            ) { DatePicker(state = vm.datePickerState) }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        MetricsRow(dayMetrics)
         Spacer(Modifier.height(8.dp))
-        Text("표본 개수: ${points.size}")
-
-        Spacer(Modifier.height(24.dp))
-        OutlinedButton(onClick = { /* TODO: 다른 액션 */ }) {
-            Text("새로고침 / 임시 버튼")
-        }
+        AssistChipRow(dayMetrics)
     }
+
+
+
 }
 
-/** 아주 가벼운 2채널 라인 차트 (추가 라이브러리 없이 Canvas 사용) */
+
+
 @Composable
-private fun LineChart(
-    dataLeft: List<Pair<Long, Float>>,
-    dataRight: List<Pair<Long, Float>>,
-    modifier: Modifier = Modifier
-) {
-    Canvas(modifier = modifier) {
-        if (dataLeft.isEmpty() && dataRight.isEmpty()) return@Canvas
-
-        val allX = (dataLeft + dataRight).map { it.first }
-        val tMin = allX.minOrNull() ?: 0L
-        val tMax = allX.maxOrNull() ?: (tMin + 1L)
-        val tSpan = (tMax - tMin).coerceAtLeast(1L).toFloat()
-
-        val yAll = (dataLeft.map { it.second } + dataRight.map { it.second })
-        val yMin = yAll.minOrNull() ?: 0f
-        val yMax = yAll.maxOrNull() ?: 1f
-        val ySpan = (yMax - yMin).takeIf { it > 1e-6f } ?: 1f
-
-        fun Pair<Long, Float>.toOffset(): ComposeOffset {
-            val x = ((first - tMin) / tSpan) * size.width
-            val y = size.height - ((second - yMin) / ySpan) * size.height
-            return ComposeOffset(x, y)
-        }
-
-        fun buildPath(data: List<Pair<Long, Float>>): ComposePath? {
-            if (data.isEmpty()) return null
-            val p = ComposePath()
-            val first = data.first().toOffset()
-            p.moveTo(first.x, first.y)
-            for (pt in data.drop(1)) {
-                val o = pt.toOffset()
-                p.lineTo(o.x, o.y)
+private fun MetricsRow(metrics: DayMetrics?) {
+    LazyColumn(
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+        contentPadding = PaddingValues(vertical = 4.dp)
+    ) {
+        item { StatCard("AmpRatio", metrics?.ampRatio) }
+        item { StatCard("PAD",      metrics?.padMs) }
+        item { StatCard("dSUT",     metrics?.dSutMs) }
+    }
+}
+@Composable
+private fun StatCard(title: String, m: MetricStat?, modifier: Modifier = Modifier) {
+    Card(
+        modifier = modifier
+            .fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Text(title, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+            if (m == null || m.count == 0) {
+                Text("데이터 없음", style = MaterialTheme.typography.bodyMedium)
+            } else {
+                Text("평균: ${m.avg.format(2)}")
+                Text("최고: ${m.max.format(2)}")
+                Text("최저: ${m.min.format(2)}")
             }
-            return p
-        }
-
-        val pathL = buildPath(dataLeft)
-        val pathR = buildPath(dataRight)
-        val stroke = Stroke(width = 3f)
-
-        pathL?.let {
-            drawPath(path = it, color = Color(0xFF4CAF50), style = stroke)
-        }
-        pathR?.let {
-            drawPath(path = it, color = Color(0xFF2196F3), alpha = 0.7f, style = stroke)
         }
     }
 }
+
+@Composable
+private fun AssistChipRow(metrics: DayMetrics?) {
+    val totalN = metrics?.ampRatio?.count ?: 0
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        AssistChip(
+            onClick = {},
+            label = { Text("총 표본 수: $totalN") }
+        )
+    }
+}
+
+private fun Double.format(digits: Int): String =
+    "%.${digits}f".format(this)

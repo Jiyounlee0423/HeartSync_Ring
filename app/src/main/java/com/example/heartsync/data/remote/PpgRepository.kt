@@ -9,7 +9,15 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeout
 import java.time.LocalDate
+import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import com.google.firebase.firestore.FieldPath
+import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.Query
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+
 
 /* =========================
  *  그래프 포인트 (로컬 정의)
@@ -230,7 +238,10 @@ class PpgRepository(
 
         suspend fun trySaveFromLine(line: String): Boolean =
             instance.trySaveFromLineInternal(line)
+
+        fun default(): PpgRepository = PpgRepository(FirebaseFirestore.getInstance())
     }
+
 
     // PpgRepository 클래스 본문 어딘가 (companion object 바깥)
     suspend fun trySaveFromLinePublic(line: String): Boolean =
@@ -349,6 +360,10 @@ class PpgRepository(
         val map = hashMapOf(
             "ownerUid" to uid,
             "event" to ev.event,
+            // 선택: 아래 2~3줄만 추가하면 호환성 ↑ (없어도 동작)
+            "eventType" to ev.event,              // ← eventType도 쓰는 코드가 있어도 OK
+            "hostIso" to ev.host_time_iso,        // ← hostIso 기대 코드 호환
+            "uid" to uid,                         // ← ownerUid 대신 uid로 필터하고 싶을 때 대비
             "host_time_iso" to ev.host_time_iso,
             "ts_ms" to ev.ts_ms,
             "alert_type" to ev.alert_type,
@@ -582,6 +597,118 @@ class PpgRepository(
             }
 
             awaitClose { listener.remove() }
+        }
+    }
+
+    fun observeDayRecords(
+        uid: String,
+        date: LocalDate,
+        zone: ZoneId
+    ): Flow<List<Map<String, Any?>>> = callbackFlow {
+        Log.d("PpgRepo", "ENTER observeDayRecords")  // ✅ 최상단 확실한 로그
+        val ymd = date.format(DateTimeFormatter.BASIC_ISO_DATE)   // yyyyMMdd
+        val idPrefix = "S_$ymd"
+        Log.d("PpgRepo", "observeDayRecords ENTER uid=$uid ymd=$ymd idPrefix=$idPrefix")
+
+        val sessionsCol = db.collection("ppg_events").document(uid).collection("sessions")
+
+
+        // 1) day == yyyyMMdd 로 조회 (가장 안전)
+        val qByDay = sessionsCol.whereEqualTo("day", ymd)
+
+        // 2) 실패/비어 있으면 문서ID prefix로 폴백
+        val qByIdPrefix = sessionsCol
+            .whereGreaterThanOrEqualTo(FieldPath.documentId(), idPrefix)
+            .whereLessThan(FieldPath.documentId(), idPrefix + "\uf8ff")
+            .orderBy(FieldPath.documentId(), Query.Direction.ASCENDING)
+
+        val recordListeners = mutableMapOf<String, ListenerRegistration>()
+        val recordsBySession = mutableMapOf<String, List<Map<String, Any?>>>()
+
+        // ✅ 여기서 emitMerged 함수를 정의
+        fun emitMerged() {
+            val merged = recordsBySession.values
+                .flatten()
+                .sortedBy { (it["ts_ms"] as? Number)?.toLong()
+                    ?: (it["timestamp"] as? Number)?.toLong()
+                    ?: Long.MAX_VALUE }
+            Log.d("PpgRepo", "emitMerged size=${merged.size}")
+            trySend(merged).isSuccess
+        }
+
+        fun clearRecordListeners(keep: Set<String>) {
+            (recordListeners.keys - keep).forEach { sid ->
+                recordListeners.remove(sid)?.remove()
+                recordsBySession.remove(sid)
+            }
+        }
+
+        fun attachRecordsListeners(sessionIds: Set<String>) {
+            (sessionIds - recordListeners.keys).forEach { sid ->
+                Log.d("PpgRepo", "attach records listener for $sid")
+                val reg = sessionsCol.document(sid)
+                    .collection("records")
+                    // 정렬 없이 안전하게. 필요 시 .orderBy("ts_ms")로 바꿔도 됨
+                    .addSnapshotListener { recSnap, recErr ->
+                        if (recErr != null) {
+                            Log.w("PpgRepo", "records($sid) listen ERROR", recErr)
+                            recordsBySession[sid] = emptyList()
+                            emitMerged()
+                            return@addSnapshotListener
+                        }
+                        val list = recSnap?.documents?.map { it.data ?: emptyMap<String, Any?>() } ?: emptyList()
+                        Log.d("PpgRepo", "records($sid): ${list.size}")
+                        recordsBySession[sid] = list
+                        emitMerged()
+                    }
+                recordListeners[sid] = reg
+            }
+        }
+
+
+        // — 우선 day 필드로 리슨
+        var usingQueryByDay = true
+        var sessionReg: ListenerRegistration? = null
+
+        fun startListening(q: com.google.firebase.firestore.Query) {
+            sessionReg?.remove()
+            sessionReg = q.addSnapshotListener { sessionSnap, sessionErr ->
+                if (sessionErr != null) {
+                    Log.w("PpgRepo", "session listen ERROR (usingQueryByDay=$usingQueryByDay)", sessionErr)
+                    // day 쿼리에서 에러면 prefix 쿼리로 폴백
+                    if (usingQueryByDay) {
+                        usingQueryByDay = false
+                        startListening(qByIdPrefix)
+                    } else {
+                        trySend(emptyList()).isSuccess
+                    }
+                    return@addSnapshotListener
+                }
+
+                val ids = sessionSnap?.documents?.map { it.id } ?: emptyList()
+                Log.d("PpgRepo", "sessions found (usingQueryByDay=$usingQueryByDay): $ids")
+
+                val current = ids.toSet()
+                clearRecordListeners(current)
+                attachRecordsListeners(current)
+                emitMerged()
+
+                // day 쿼리로 리슨했는데 결과가 0이면 즉시 prefix 쿼리로 폴백
+                if (usingQueryByDay && ids.isEmpty()) {
+                    usingQueryByDay = false
+                    startListening(qByIdPrefix)
+                }
+            }
+        }
+
+        startListening(qByDay)
+
+        awaitClose {
+            Log.d("PpgRepo", "observeDayRecords CLOSE")
+            sessionReg?.remove()
+            recordListeners.values.forEach { it.remove() }
+            recordListeners.clear()
+            recordsBySession.clear()
         }
     }
 }

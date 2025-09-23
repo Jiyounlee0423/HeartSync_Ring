@@ -1,3 +1,4 @@
+// app/src/main/java/com/example/heartsync/ui/screens/NotiLogScreen.kt
 package com.example.heartsync.ui.screens
 
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -10,8 +11,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.heartsync.ui.screens.model.NotiLogSection
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -36,7 +35,7 @@ fun NotiLogScreen(
                     Surface(color = MaterialTheme.colorScheme.surface) {
                         Text(
                             text = section.date,
-                            style = MaterialTheme.typography.titleMedium, // ✅ 오타 수정
+                            style = MaterialTheme.typography.titleMedium,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(vertical = 6.dp)
@@ -48,7 +47,7 @@ fun NotiLogScreen(
                         Column(Modifier.padding(16.dp)) {
                             val timeStr = row.localTimeStr(java.time.ZoneId.systemDefault())
                             val reasonLine = if (row.reasons.isNotEmpty())
-                                row.reasons.joinToString(", ")   // ✅ 가독성 좋은 기본형
+                                row.reasons.joinToString(", ")
                             else "이유 미지정"
 
                             Text("$timeStr · $reasonLine", style = MaterialTheme.typography.bodyLarge)
