@@ -97,21 +97,39 @@ class NotiLogRepository(
                     Log.w(TAG_LOCAL, "sessions listen error: ${root.path}", err)
                     return@addSnapshotListener
                 }
+
+                val rootPathPrefix = root.path + "/"
                 val sessionPaths = snap?.documents?.map { it.reference.path }?.toSet() ?: emptySet()
 
-                // 1) 제거된 세션: 리스너 해제 + rows 제거
-                val existingSessions = recordRegsBySession.keys.toSet()
+                // 🔴 스냅샷이 비었으면: 이 루트의 "해당 날짜" 세션 데이터/리스너를 전부 제거
+                if (snap == null || snap.isEmpty) {
+                    // 이 루트 + 해당 날짜 prefix 를 가지는 세션들만 골라서 정리
+                    val toDrop = recordRegsBySession.keys.filter { sp ->
+                        sp.startsWith(rootPathPrefix) && sp.substringAfterLast("/")
+                            .startsWith("S_${ymd}_")
+                    }
+                    toDrop.forEach { sp ->
+                        recordRegsBySession.remove(sp)?.remove()
+                        val prefix = "$sp/records/"
+                        rowsByPath.keys.filter { it.startsWith(prefix) }.forEach { rowsByPath.remove(it) }
+                    }
+                    emitNow()   // ← 빈 목록이면 빈 목록이 그대로 emit 됨
+                    return@addSnapshotListener
+                }
+
+                // 기존/추가/삭제 세션 차집합 로직(그대로 유지)
+                val existingSessions = recordRegsBySession.keys
+                    .filter { it.startsWith(rootPathPrefix) }
+                    .toSet()
+
                 val removed = existingSessions - sessionPaths
                 removed.forEach { sp ->
                     recordRegsBySession.remove(sp)?.remove()
-                    // 해당 세션의 데이터 삭제 후 emit
                     val prefix = "$sp/records/"
-                    val toRemove = rowsByPath.keys.filter { it.startsWith(prefix) }
-                    toRemove.forEach { rowsByPath.remove(it) }
+                    rowsByPath.keys.filter { it.startsWith(prefix) }.forEach { rowsByPath.remove(it) }
                 }
                 if (removed.isNotEmpty()) emitNow()
 
-                // 2) 추가된 세션: 레코드 리스너 설치 (단일 리스너로 ALERT/레거시 모두 처리)
                 val added = sessionPaths - existingSessions
                 added.forEach { sp ->
                     val recs = db.document(sp).collection("records")
@@ -120,7 +138,7 @@ class NotiLogRepository(
                             Log.w(TAG_LOCAL, "records listen error: $sp", e)
                             return@addSnapshotListener
                         }
-                        updateSessionRows(sp, rs)
+                        updateSessionRows(sp, rs)   // 세션 단위로 rowsByPath 갱신 → emitNow() 호출됨
                     }
                     recordRegsBySession[sp] = rr
                 }

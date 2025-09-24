@@ -10,6 +10,9 @@ import kotlinx.coroutines.launch
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.onEach
 
 class NotiLogViewModel(
     private val repo: NotiLogRepository,
@@ -34,6 +37,8 @@ class NotiLogViewModel(
 
     init { reload() }
 
+    private var collectJob: Job? = null
+
     fun setDate(date: LocalDate) {
         if (date != _selectedDate.value) {
             _selectedDate.value = date
@@ -42,22 +47,27 @@ class NotiLogViewModel(
     }
 
     fun reload() {
-        viewModelScope.launch {
-            _loading.value = true
-            var firstEmission = true
+        // ✅ 이전 수집 취소 + 화면 즉시 초기화
+        collectJob?.cancel()
+        _rows.value = emptyList()
+        _loading.value = true
+
+        collectJob = viewModelScope.launch {
+            var first = true
             repo.observeAlertsByDate(_selectedDate.value)
                 .onEach { list ->
-                    _rows.value = list
-                    if (firstEmission) {
-                        firstEmission = false
-                        _loading.value = false   // ← 첫 스냅샷(빈 목록이어도) 받으면 로딩 종료
+                    _rows.value = list          // 빈 리스트여도 바로 반영
+                    if (first) {
+                        first = false
+                        _loading.value = false   // 첫 스냅샷(빈/유효 모두)에서 로딩 종료
                     }
                 }
                 .catch {
                     _rows.value = emptyList()
                     _loading.value = false
                 }
-                .collect()   // 실시간 수집 유지
+                .collect()
         }
     }
+
 }

@@ -31,3 +31,10 @@ fun NotiLogRow.localDate(zone: ZoneId = KST): LocalDate =
 
 fun NotiLogRow.localTimeStr(zone: ZoneId = KST): String =
     (instantOrNull() ?: Instant.EPOCH).atZone(zone).toLocalTime().format(TIME_FMT)
+
+private fun translateReason(reason: String): String = when (reason) {
+    "AmpRatio low" -> "진폭 비율 낮음"
+    "PAD high"     -> "맥파 지연(PAD) 증가"
+    "dSUT high"    -> "상승시간 차이(dSUT) 증가"
+    else           -> reason // 미정의 키는 원문 그대로
+}

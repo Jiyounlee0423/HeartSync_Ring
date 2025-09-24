@@ -43,6 +43,7 @@ fun NotiLogScreen(vm: NotiLogViewModel) {
 
     var showPicker by remember { mutableStateOf(false) }
 
+
     val hScroll = rememberScrollState()
 
     Scaffold(
@@ -102,40 +103,68 @@ fun NotiLogScreen(vm: NotiLogViewModel) {
                 }
                 HorizontalDivider()
 
-                // ==== 리스트 ====
-                LazyColumn(
-                    modifier = Modifier.fillMaxHeight(),
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(rows, key = { it.id }) { r ->
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                r.localTimeStr(ZoneId.of("Asia/Seoul")),
-                                Modifier.width(wTime),
-                                maxLines = 1,
-                                overflow = TextOverflow.Clip
-                            )
-                            Text(
-                                r.side ?: "-",
-                                Modifier.width(wSide),
-                                maxLines = 1,
-                                overflow = TextOverflow.Clip
-                            )
-                            Text(
-                                r.reasons?.joinToString() ?: "-",
-                                Modifier.width(wReasons),
-                                maxLines = 1,              // 줄바꿈 없이 가로로만
-                                overflow = TextOverflow.Clip
-                            )
-                            Text(r.ampRatio?.let { "%.2f".format(it) } ?: "-", Modifier.width(wAmp))
-                            Text(r.padMs?.let { "%.0f".format(it) } ?: "-",  Modifier.width(wPad))
-                            Text(r.dSutMs?.let { "%.0f".format(it) } ?: "-", Modifier.width(wDSut))
+                if (!loading && rows.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(top = 8.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "선택한 날짜에 이상 알림이 없습니다",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                } else {
+                    // ==== 리스트 ====
+                    LazyColumn(
+                        modifier = Modifier.fillMaxHeight(),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(rows, key = { it.id }) { r ->
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    r.localTimeStr(ZoneId.of("Asia/Seoul")),
+                                    Modifier.width(wTime),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Clip
+                                )
+                                Text(
+                                    r.side ?: "-",
+                                    Modifier.width(wSide),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Clip
+                                )
+                                // 교체 (줄바꿈 + 불릿)
+                                val reasonsText = r.reasons
+                                    ?.joinToString(separator = "\n") { reason ->
+                                        "• " + translateReason(
+                                            reason
+                                        )
+                                    }
+                                    ?: "-"
+
+                                Text(
+                                    text = reasonsText,
+                                    modifier = Modifier.width(wReasons),
+                                    maxLines = 5,            // 필요하면 늘리거나 없애기
+                                    softWrap = true,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(r.ampRatio?.let { "%.2f".format(it) } ?: "-",
+                                    Modifier.width(wAmp))
+                                Text(r.padMs?.let { "%.0f".format(it) } ?: "-",
+                                    Modifier.width(wPad))
+                                Text(r.dSutMs?.let { "%.0f".format(it) } ?: "-",
+                                    Modifier.width(wDSut))
+                            }
+                            HorizontalDivider()
                         }
-                        HorizontalDivider()
                     }
                 }
             }
@@ -205,4 +234,12 @@ private fun DatePickerSheet(
             }) { Text("확인") }
         }
     }
+}
+// 영어 reasons → 한글 표시용 변환
+private fun translateReason(reason: String): String = when (reason) {
+    "AmpRatio low" -> "진폭 비율 낮음"
+    "PAD high"     -> "맥파 지연(PAD) 증가"
+    "dSUT high"    -> "상승시간 차이(dSUT) 증가"
+    "PQI low"      -> "신호 품질(PQI) 낮음"
+    else           -> reason // 모르는 키는 그대로
 }
