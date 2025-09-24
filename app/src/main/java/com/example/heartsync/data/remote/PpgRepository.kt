@@ -17,6 +17,11 @@ import com.google.firebase.firestore.Query
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import com.google.firebase.firestore.DocumentSnapshot
+import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.tasks.await
+
+
 
 
 /* =========================
@@ -600,100 +605,119 @@ class PpgRepository(
         }
     }
 
+    // PATCH v3: filter by event == STAT or ALERT (client-side), keep hard limits & logs
     fun observeDayRecords(
         uid: String,
         date: LocalDate,
         zone: ZoneId
     ): Flow<List<Map<String, Any?>>> = callbackFlow {
-        Log.d("PpgRepo", "ENTER observeDayRecords")  // ✅ 최상단 확실한 로그
+        val TAG = "PpgRepo"
         val ymd = date.format(DateTimeFormatter.BASIC_ISO_DATE)   // yyyyMMdd
         val idPrefix = "S_$ymd"
-        Log.d("PpgRepo", "observeDayRecords ENTER uid=$uid ymd=$ymd idPrefix=$idPrefix")
+        Log.d(TAG, "observeDayRecords ENTER uid=$uid ymd=$ymd idPrefix=$idPrefix")
 
         val sessionsCol = db.collection("ppg_events").document(uid).collection("sessions")
 
+        // ===== 하드 제한 / 옵션 =====
+        val MAX_SESSIONS = 6               // 하루에 리슨할 최대 세션 수
+        val PER_SESSION_LIMIT = 2000L      // 세션별 레코드 최대 개수
+        val EVENTS_FILTER = setOf("STAT", "ALERT")  // ← event 필드 기준 허용 값
+        // ===========================
 
-        // 1) day == yyyyMMdd 로 조회 (가장 안전)
+        // 세션 찾기: day 우선, 없으면 문서ID prefix 폴백
         val qByDay = sessionsCol.whereEqualTo("day", ymd)
+            .orderBy(FieldPath.documentId())
 
-        // 2) 실패/비어 있으면 문서ID prefix로 폴백
         val qByIdPrefix = sessionsCol
-            .whereGreaterThanOrEqualTo(FieldPath.documentId(), idPrefix)
-            .whereLessThan(FieldPath.documentId(), idPrefix + "\uf8ff")
-            .orderBy(FieldPath.documentId(), Query.Direction.ASCENDING)
+            .orderBy(FieldPath.documentId())
+            .startAt(idPrefix)
+            .endAt(idPrefix + "\uf8ff")
 
         val recordListeners = mutableMapOf<String, ListenerRegistration>()
         val recordsBySession = mutableMapOf<String, List<Map<String, Any?>>>()
 
-        // ✅ 여기서 emitMerged 함수를 정의
+        fun clientFilter(list: List<Map<String, Any?>>): List<Map<String, Any?>> {
+            // event 필드 우선, 없으면 eventType 폴백. 둘 다 없으면 제외.
+            return list.asSequence().filter { m ->
+                val e = ((m["event"] ?: m["eventType"])?.toString() ?: "").uppercase()
+                e in EVENTS_FILTER
+            }.toList()
+        }
+
         fun emitMerged() {
             val merged = recordsBySession.values
                 .flatten()
-                .sortedBy { (it["ts_ms"] as? Number)?.toLong()
-                    ?: (it["timestamp"] as? Number)?.toLong()
-                    ?: Long.MAX_VALUE }
-            Log.d("PpgRepo", "emitMerged size=${merged.size}")
+                .let(::clientFilter)
+                .sortedBy {
+                    (it["ts_ms"] as? Number)?.toLong()
+                        ?: (it["timestamp"] as? Number)?.toLong()
+                        ?: (it["server_ts"] as? com.google.firebase.Timestamp)?.toDate()?.time
+                        ?: Long.MAX_VALUE
+                }
+            Log.d(TAG, "emitMerged size=${merged.size}")
             trySend(merged).isSuccess
         }
 
         fun clearRecordListeners(keep: Set<String>) {
             (recordListeners.keys - keep).forEach { sid ->
+                Log.d(TAG, "remove records listener for $sid")
                 recordListeners.remove(sid)?.remove()
                 recordsBySession.remove(sid)
             }
         }
 
-        fun attachRecordsListeners(sessionIds: Set<String>) {
+        fun attachRecordsListeners(sessionIdsAll: Set<String>) {
+            val sessionIds = sessionIdsAll.take(MAX_SESSIONS).toSet()
+
             (sessionIds - recordListeners.keys).forEach { sid ->
-                Log.d("PpgRepo", "attach records listener for $sid")
-                val reg = sessionsCol.document(sid)
+                Log.d(TAG, "attach records listener for $sid")
+                // 쿼리에서는 필터 X: 정렬 + limit만 적용
+                val q: Query = sessionsCol.document(sid)
                     .collection("records")
-                    // 정렬 없이 안전하게. 필요 시 .orderBy("ts_ms")로 바꿔도 됨
-                    .addSnapshotListener { recSnap, recErr ->
-                        if (recErr != null) {
-                            Log.w("PpgRepo", "records($sid) listen ERROR", recErr)
-                            recordsBySession[sid] = emptyList()
-                            emitMerged()
-                            return@addSnapshotListener
-                        }
-                        val list = recSnap?.documents?.map { it.data ?: emptyMap<String, Any?>() } ?: emptyList()
-                        Log.d("PpgRepo", "records($sid): ${list.size}")
-                        recordsBySession[sid] = list
+                    .orderBy("server_ts", Query.Direction.ASCENDING)
+                    .limit(PER_SESSION_LIMIT)
+
+                val reg = q.addSnapshotListener { recSnap, recErr ->
+                    if (recErr != null) {
+                        Log.w(TAG, "records($sid) listen ERROR", recErr)
+                        recordsBySession[sid] = emptyList()
                         emitMerged()
+                        return@addSnapshotListener
                     }
+                    val docs = recSnap?.documents ?: emptyList()
+                    val list = docs.map { it.data ?: emptyMap<String, Any?>() }
+                    Log.d(TAG, "records($sid): raw=${list.size}, cap=$PER_SESSION_LIMIT")
+                    recordsBySession[sid] = list
+                    emitMerged()
+                }
                 recordListeners[sid] = reg
             }
+
+            clearRecordListeners(sessionIds)
         }
 
-
-        // — 우선 day 필드로 리슨
         var usingQueryByDay = true
         var sessionReg: ListenerRegistration? = null
 
-        fun startListening(q: com.google.firebase.firestore.Query) {
+        fun startListening(q: Query) {
             sessionReg?.remove()
             sessionReg = q.addSnapshotListener { sessionSnap, sessionErr ->
                 if (sessionErr != null) {
-                    Log.w("PpgRepo", "session listen ERROR (usingQueryByDay=$usingQueryByDay)", sessionErr)
-                    // day 쿼리에서 에러면 prefix 쿼리로 폴백
+                    Log.w(TAG, "session listen ERROR (usingQueryByDay=$usingQueryByDay)", sessionErr)
                     if (usingQueryByDay) {
                         usingQueryByDay = false
                         startListening(qByIdPrefix)
-                    } else {
-                        trySend(emptyList()).isSuccess
                     }
                     return@addSnapshotListener
                 }
 
-                val ids = sessionSnap?.documents?.map { it.id } ?: emptyList()
-                Log.d("PpgRepo", "sessions found (usingQueryByDay=$usingQueryByDay): $ids")
+                val allIds = sessionSnap?.documents?.map { it.id } ?: emptyList()
+                val ids = allIds.take(MAX_SESSIONS)
+                Log.d(TAG, "sessions found (usingQueryByDay=$usingQueryByDay): $allIds -> capped: $ids")
 
-                val current = ids.toSet()
-                clearRecordListeners(current)
-                attachRecordsListeners(current)
+                attachRecordsListeners(ids.toSet())
                 emitMerged()
 
-                // day 쿼리로 리슨했는데 결과가 0이면 즉시 prefix 쿼리로 폴백
                 if (usingQueryByDay && ids.isEmpty()) {
                     usingQueryByDay = false
                     startListening(qByIdPrefix)
@@ -704,11 +728,66 @@ class PpgRepository(
         startListening(qByDay)
 
         awaitClose {
-            Log.d("PpgRepo", "observeDayRecords CLOSE")
+            Log.d(TAG, "observeDayRecords CLOSE")
             sessionReg?.remove()
             recordListeners.values.forEach { it.remove() }
             recordListeners.clear()
             recordsBySession.clear()
         }
     }
+    /**
+     * 날짜별 모든 records를 페이지네이션으로 끝까지 읽으면서 onEach에 한 건씩 넘긴다.
+     * - 실시간 리슨이 아님 (정확 요약/재계산 버튼용)
+     * - 메모리 O(1) (큰 리스트를 만들지 않음)
+     */
+    suspend fun foldDayRecordsPaged(
+        uid: String,
+        date: LocalDate,
+        zone: ZoneId,
+        pageSize: Long = 3000L,
+        eventsFilter: Set<String> = setOf("STAT", "ALERT"),
+        onEach: (Map<String, Any?>) -> Unit
+    ) {
+        val ymd = date.format(DateTimeFormatter.BASIC_ISO_DATE)
+        val idPrefix = "S_$ymd"
+        val sessionsCol = db.collection("ppg_events").document(uid).collection("sessions")
+
+        // 1) 세션 목록: day 우선, 없으면 id prefix 폴백
+        val sessionIds = run {
+            val byDay = sessionsCol.whereEqualTo("day", ymd).get().await().documents.map { it.id }
+            if (byDay.isNotEmpty()) byDay else {
+                sessionsCol.orderBy(FieldPath.documentId())
+                    .startAt(idPrefix).endAt(idPrefix + "\uf8ff")
+                    .get().await().documents.map { it.id }
+            }
+        }
+
+        val allowed = eventsFilter.map { it.uppercase() }.toSet()
+
+        // 2) 각 세션을 페이지 단위로 끝까지 스캔
+        for (sid in sessionIds) {
+            var last: DocumentSnapshot? = null
+            while (true) {
+                var q: Query = sessionsCol.document(sid)
+                    .collection("records")
+                    .orderBy("server_ts", Query.Direction.ASCENDING)
+                    .limit(pageSize)
+
+                if (last != null) q = q.startAfter(last)
+
+                val snap = q.get().await()
+                if (snap.isEmpty) break
+
+                val docs = snap.documents
+                for (d in docs) {
+                    val m = d.data ?: continue
+                    val ev = ((m["event"] ?: m["eventType"])?.toString() ?: "").uppercase()
+                    if (allowed.isEmpty() || ev in allowed) onEach(m)
+                }
+                last = docs.last()
+                if (docs.size < pageSize) break // 끝
+            }
+        }
+    }
+
 }
