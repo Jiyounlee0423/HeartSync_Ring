@@ -44,11 +44,20 @@ class NotiLogViewModel(
     fun reload() {
         viewModelScope.launch {
             _loading.value = true
+            var firstEmission = true
             repo.observeAlertsByDate(_selectedDate.value)
-                .onEach { _rows.value = it.sortedBy { r -> r.localDate(zone) } } // 안전
-                .catch { _rows.value = emptyList() }
-                .onCompletion { _loading.value = false }
-                .collect() // 화면 생명주기 동안 유지 (Service 아님)
+                .onEach { list ->
+                    _rows.value = list
+                    if (firstEmission) {
+                        firstEmission = false
+                        _loading.value = false   // ← 첫 스냅샷(빈 목록이어도) 받으면 로딩 종료
+                    }
+                }
+                .catch {
+                    _rows.value = emptyList()
+                    _loading.value = false
+                }
+                .collect()   // 실시간 수집 유지
         }
     }
 }

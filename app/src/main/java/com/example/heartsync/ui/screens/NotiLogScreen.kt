@@ -19,6 +19,10 @@ import com.example.heartsync.ui.screens.model.localTimeStr
 import androidx.compose.material3.DatePicker
 import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.rememberDatePickerState
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.width
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -39,6 +43,8 @@ fun NotiLogScreen(vm: NotiLogViewModel) {
 
     var showPicker by remember { mutableStateOf(false) }
 
+    val hScroll = rememberScrollState()
+
     Scaffold(
         topBar = {
             // ✅ SmallTopAppBar 대신 CenterAlignedTopAppBar 사용
@@ -48,11 +54,13 @@ fun NotiLogScreen(vm: NotiLogViewModel) {
                     TextButton(onClick = { showPicker = true }) {
                         Text(selDate.format(DateTimeFormatter.ISO_DATE))
                     }
-                }
+                },
+                windowInsets = WindowInsets(0.dp)
+
             )
         }
     ) { inner ->
-        Column(Modifier.padding(inner)) {
+        Column(Modifier.padding(inner).padding(top = 0.dp) ) {
             if (loading) {
                 LinearProgressIndicator(Modifier.fillMaxWidth())
             }
@@ -65,53 +73,70 @@ fun NotiLogScreen(vm: NotiLogViewModel) {
                     .padding(horizontal = 16.dp, vertical = 12.dp)
             )
 
-            Row(
+            // 가로 스크롤 컨테이너
+            Column(
                 Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    .fillMaxSize()
+                    .horizontalScroll(hScroll)   // ← 가로 스크롤 가능
             ) {
-                Text("시각",    Modifier.weight(0.9f), style = MaterialTheme.typography.labelLarge)
-                Text("side",    Modifier.weight(0.8f), style = MaterialTheme.typography.labelLarge)
-                Text("reasons", Modifier.weight(2.2f), style = MaterialTheme.typography.labelLarge)
-                Text("AmpRatio",Modifier.weight(1.1f), style = MaterialTheme.typography.labelLarge)
-                Text("PAD(ms)", Modifier.weight(1.0f), style = MaterialTheme.typography.labelLarge)
-                Text("dSUT(ms)",Modifier.weight(1.1f), style = MaterialTheme.typography.labelLarge)
-            }
+                // 각 컬럼의 고정 폭(dp) — 필요하면 숫자 조절
+                val wTime = 90.dp
+                val wSide = 80.dp
+                val wReasons = 320.dp
+                val wAmp = 100.dp
+                val wPad = 90.dp
+                val wDSut = 100.dp
 
-            // ✅ Divider → HorizontalDivider
-            HorizontalDivider()
+                // ==== 헤더 ====
+                Row(
+                    Modifier
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text("시각",    Modifier.width(wTime),   style = MaterialTheme.typography.labelLarge)
+                    Text("side",    Modifier.width(wSide),   style = MaterialTheme.typography.labelLarge)
+                    Text("reasons", Modifier.width(wReasons),style = MaterialTheme.typography.labelLarge)
+                    Text("AmpRatio",Modifier.width(wAmp),    style = MaterialTheme.typography.labelLarge)
+                    Text("PAD(ms)", Modifier.width(wPad),    style = MaterialTheme.typography.labelLarge)
+                    Text("dSUT(ms)",Modifier.width(wDSut),   style = MaterialTheme.typography.labelLarge)
+                }
+                HorizontalDivider()
 
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                items(rows, key = { it.id }) { r ->
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            r.localTimeStr(ZoneId.of("Asia/Seoul")),
-                            Modifier.weight(0.9f),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(r.side ?: "-", Modifier.weight(0.8f), maxLines = 1)
-                        Text(
-                            r.reasons?.joinToString() ?: "-",
-                            Modifier.weight(2.2f),
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        // ✅ 카멜케이스 필드명
-                        Text(r.ampRatio?.let { "%.2f".format(it) } ?: "-", Modifier.weight(1.1f))
-                        Text(r.padMs?.let { "%.0f".format(it) } ?: "-",  Modifier.weight(1.0f))
-                        Text(r.dSutMs?.let { "%.0f".format(it) } ?: "-", Modifier.weight(1.1f))
+                // ==== 리스트 ====
+                LazyColumn(
+                    modifier = Modifier.fillMaxHeight(),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(rows, key = { it.id }) { r ->
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                r.localTimeStr(ZoneId.of("Asia/Seoul")),
+                                Modifier.width(wTime),
+                                maxLines = 1,
+                                overflow = TextOverflow.Clip
+                            )
+                            Text(
+                                r.side ?: "-",
+                                Modifier.width(wSide),
+                                maxLines = 1,
+                                overflow = TextOverflow.Clip
+                            )
+                            Text(
+                                r.reasons?.joinToString() ?: "-",
+                                Modifier.width(wReasons),
+                                maxLines = 1,              // 줄바꿈 없이 가로로만
+                                overflow = TextOverflow.Clip
+                            )
+                            Text(r.ampRatio?.let { "%.2f".format(it) } ?: "-", Modifier.width(wAmp))
+                            Text(r.padMs?.let { "%.0f".format(it) } ?: "-",  Modifier.width(wPad))
+                            Text(r.dSutMs?.let { "%.0f".format(it) } ?: "-", Modifier.width(wDSut))
+                        }
+                        HorizontalDivider()
                     }
-                    HorizontalDivider()
                 }
             }
         }

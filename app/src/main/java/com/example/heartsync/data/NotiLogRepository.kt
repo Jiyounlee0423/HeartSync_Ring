@@ -20,6 +20,7 @@ class NotiLogRepository(
 
     private val dateFmt = DateTimeFormatter.ofPattern("yyyyMMdd")
 
+
     fun observeAlertsByDate(date: LocalDate, limitPerSession: Long = 1000): Flow<List<NotiLogRow>> = callbackFlow {
         val uid = auth.currentUser?.uid
         if (uid == null) {
@@ -29,88 +30,114 @@ class NotiLogRepository(
         }
 
         val ymd = date.format(dateFmt)
+        val TAG_LOCAL = "$TAG/$ymd"
 
-        // ✅ 두 경로를 모두 리슨 (ppg_events 우선, users 보조)
-        val roots = listOf(
+        // 두 개 루트 모두 리슨
+        val sessionRoots = listOf(
             db.collection("ppg_events").document(uid).collection("sessions"),
             db.collection("users").document(uid).collection("sessions")
         )
 
-        // 세션 리스너/레코드 리스너를 전부 관리
-        val sessionRegs = mutableListOf<ListenerRegistration>()
-        childRegs.forEach { it.remove() }
-        childRegs.clear()
+        // 전역 누적 공간: 문서 경로 → Row
+        val rowsByPath = mutableMapOf<String, NotiLogRow>()
 
-        fun listenOnSessions(sessionsRef: CollectionReference) {
-            val q = sessionsRef
+        // 세션 목록 리스너, 세션별 레코드 리스너를 관리
+        val sessionRegs = mutableListOf<ListenerRegistration>()
+        val recordRegsBySession = mutableMapOf<String, ListenerRegistration>() // key = sessionPath
+
+        fun emitNow() {
+            val out = rowsByPath.values
+                .filter { it.eventType == "ALERT" || it.alertType != null }
+                .sortedByDescending { it.epochMs ?: 0L }
+            trySend(out)
+        }
+
+        // 세션ID → epoch 복원
+        fun epochFromSessionIdOrNull(sessionPath: String): Long? {
+            val sid = sessionPath.substringAfterLast("/")
+            if (sid.length < 18) return null
+            val head = sid.substring(0, 18) // S_yyyyMMdd_HHmmss_
+            return runCatching {
+                LocalDateTime.parse(head, SID_FMT).atZone(KST).toInstant().toEpochMilli()
+            }.getOrNull()
+        }
+
+        // 레코드 스냅샷을 rowsByPath에 반영 (세션 단위로 덮어쓰기)
+        fun updateSessionRows(sessionPath: String, rs: QuerySnapshot?) {
+            // 1) 해당 세션의 기존 항목 제거
+            val prefix = "$sessionPath/records/"
+            val toRemove = rowsByPath.keys.filter { it.startsWith(prefix) }
+            toRemove.forEach { rowsByPath.remove(it) }
+
+            // 2) 새 스냅샷 반영
+            rs?.documents?.forEach { doc ->
+                val pathKey = doc.reference.path
+                val row = toRow(doc)?.let { r ->
+                    // epoch 보강: 없으면 세션ID에서 복원
+                    val e = r.epochMs ?: epochFromSessionIdOrNull(sessionPath)
+                    r.copy(epochMs = e)
+                }
+                if (row != null && (row.eventType == "ALERT" || row.alertType != null)) {
+                    rowsByPath[pathKey] = row
+                }
+            }
+            emitNow()
+            Log.d(TAG, "updateSessionRows session=$sessionPath size=${rs?.size()}")
+        }
+
+        // 세션들을 리슨: 추가/제거만 반영
+        fun listenSessions(root: CollectionReference) {
+            val q = root
                 .orderBy(FieldPath.documentId())
                 .startAt("S_${ymd}_")
                 .endAt("S_${ymd}_\uf8ff")
 
             val reg = q.addSnapshotListener { snap, err ->
                 if (err != null) {
-                    Log.e(TAG, "sessions listen error (${sessionsRef.path})", err)
-                    trySend(emptyList())
+                    Log.w(TAG_LOCAL, "sessions listen error: ${root.path}", err)
                     return@addSnapshotListener
                 }
+                val sessionPaths = snap?.documents?.map { it.reference.path }?.toSet() ?: emptySet()
 
-                // 기존 레코드 리스너 제거 후 재구성
-                childRegs.forEach { it.remove() }
-                childRegs.clear()
-
-                if (snap == null || snap.isEmpty) {
-                    // 다른 루트가 채워줄 수 있으니 여기선 비우지 않음
-                    return@addSnapshotListener
+                // 1) 제거된 세션: 리스너 해제 + rows 제거
+                val existingSessions = recordRegsBySession.keys.toSet()
+                val removed = existingSessions - sessionPaths
+                removed.forEach { sp ->
+                    recordRegsBySession.remove(sp)?.remove()
+                    // 해당 세션의 데이터 삭제 후 emit
+                    val prefix = "$sp/records/"
+                    val toRemove = rowsByPath.keys.filter { it.startsWith(prefix) }
+                    toRemove.forEach { rowsByPath.remove(it) }
                 }
+                if (removed.isNotEmpty()) emitNow()
 
-                val allRows = mutableListOf<NotiLogRow>()
-
-                snap.documents.forEach { sessDoc ->
-                    val recs = sessDoc.reference.collection("records")
-
-                    // ALERT 전용
-                    val qAlert = recs.whereEqualTo("eventType", "ALERT")
-                        .limit(limitPerSession)
-
-                    val reg1 = qAlert.addSnapshotListener { rs, e1 ->
-                        if (e1 != null) {
-                            Log.w(TAG, "records(alert/eventType) listen error", e1)
+                // 2) 추가된 세션: 레코드 리스너 설치 (단일 리스너로 ALERT/레거시 모두 처리)
+                val added = sessionPaths - existingSessions
+                added.forEach { sp ->
+                    val recs = db.document(sp).collection("records")
+                    val rr = recs.limit(limitPerSession).addSnapshotListener { rs, e ->
+                        if (e != null) {
+                            Log.w(TAG_LOCAL, "records listen error: $sp", e)
                             return@addSnapshotListener
                         }
-                        val rows1 = rs?.documents?.mapNotNull { toRow(it) } ?: emptyList()
-
-                        // 레거시(event == "ALERT")
-                        val qLegacy = recs.limit(200L)
-                        val reg2 = qLegacy.addSnapshotListener { rs2, e2 ->
-                            if (e2 != null) {
-                                Log.w(TAG, "records(legacy/event) listen error", e2)
-                                updateAndEmit(allRows, rows1) { snapshot -> trySend(snapshot) }
-                                return@addSnapshotListener
-                            }
-                            val legacy = rs2?.documents
-                                ?.mapNotNull { toRow(it) }
-                                ?.filter { it.eventType == "ALERT" || (it.alertType != null) }
-                                ?: emptyList()
-
-                            updateAndEmit(allRows, rows1 + legacy) { snapshot -> trySend(snapshot) }
-                        }
-                        childRegs.add(reg2)
+                        updateSessionRows(sp, rs)
                     }
-                    childRegs.add(reg1)
+                    recordRegsBySession[sp] = rr
                 }
             }
             sessionRegs.add(reg)
         }
 
-        // 두 루트 모두 리슨 시작
-        roots.forEach { listenOnSessions(it) }
+        sessionRoots.forEach { listenSessions(it) }
 
         awaitClose {
             sessionRegs.forEach { it.remove() }
-            childRegs.forEach { it.remove() }
-            childRegs.clear()
+            recordRegsBySession.values.forEach { it.remove() }
+            recordRegsBySession.clear()
+            rowsByPath.clear()
         }
     }
+
 
     // === 내부 상태 ===
     private val childRegs = mutableListOf<ListenerRegistration>()
