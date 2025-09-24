@@ -1,14 +1,16 @@
-// app/src/main/java/com/example/heartsync/ui/screens/NotiLogRepository.kt
-package com.example.heartsync.ui.screens
+package com.example.heartsync.data
 
 import android.util.Log
 import com.example.heartsync.ui.screens.model.NotiLogRow
 import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.*
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
-import java.time.Instant
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.time.*
+
 
 class NotiLogRepository(
     private val db: FirebaseFirestore,
@@ -16,89 +18,193 @@ class NotiLogRepository(
 ) {
     companion object { private const val TAG = "NotiLogRepository" }
 
-    /**
-     * collectionGroup("records")에서 현재 사용자(ownerUid 또는 uid) + ALERT 만 수집
-     * - 스키마 호환: eventType 또는 event 둘 다 지원
-     * - hostIso 없는 문서는 server_ts 로 ISO 문자열 생성
-     * - AmpRatio, PAD, dSUT 키 혼용 대응 (PAD_ms, dSUT_ms 포함)
-     */
-    fun observeAlertRows(limit: Long = 500): Flow<List<NotiLogRow>> = callbackFlow {
+    private val dateFmt = DateTimeFormatter.ofPattern("yyyyMMdd")
+
+    fun observeAlertsByDate(date: LocalDate, limitPerSession: Long = 1000): Flow<List<NotiLogRow>> = callbackFlow {
         val uid = auth.currentUser?.uid
         if (uid == null) {
-            Log.w(TAG, "observeAlertRows: no auth uid")
             trySend(emptyList())
-            close(); return@callbackFlow
+            close(IllegalStateException("Not signed in"))
+            return@callbackFlow
         }
 
-        val base = db.collectionGroup("records")
+        val ymd = date.format(dateFmt)
 
-        // ownerUid/uid 어느 필드가 저장되었는지에 따라 둘 다 시도
-        // (둘 다 저장했다면 ownerUid 쿼리로 충분)
-        val qEventType = base
-            .whereEqualTo("ownerUid", uid)
-            .whereEqualTo("eventType", "ALERT")
-            .limit(limit)
+        // ✅ 두 경로를 모두 리슨 (ppg_events 우선, users 보조)
+        val roots = listOf(
+            db.collection("ppg_events").document(uid).collection("sessions"),
+            db.collection("users").document(uid).collection("sessions")
+        )
 
-        val qEvent = base
-            .whereEqualTo("ownerUid", uid)
-            .whereEqualTo("event", "ALERT")
-            .limit(limit)
+        // 세션 리스너/레코드 리스너를 전부 관리
+        val sessionRegs = mutableListOf<ListenerRegistration>()
+        childRegs.forEach { it.remove() }
+        childRegs.clear()
 
-        var cache1: List<NotiLogRow> = emptyList()
-        var cache2: List<NotiLogRow> = emptyList()
+        fun listenOnSessions(sessionsRef: CollectionReference) {
+            val q = sessionsRef
+                .orderBy(FieldPath.documentId())
+                .startAt("S_${ymd}_")
+                .endAt("S_${ymd}_\uf8ff")
 
-        fun toRow(id: String, data: Map<String, Any?>?): NotiLogRow? {
-            if (data == null) return null
+            val reg = q.addSnapshotListener { snap, err ->
+                if (err != null) {
+                    Log.e(TAG, "sessions listen error (${sessionsRef.path})", err)
+                    trySend(emptyList())
+                    return@addSnapshotListener
+                }
 
-            // hostIso 우선, 없으면 host_time_iso, 그것도 없으면 server_ts 로 보정
-            val hostIso = when (val v = data["hostIso"] ?: data["host_time_iso"]) {
-                is String -> v
-                else -> {
-                    val ts = (data["server_ts"] as? com.google.firebase.Timestamp)?.toDate()?.time
-                    if (ts != null) Instant.ofEpochMilli(ts).toString() else ""
+                // 기존 레코드 리스너 제거 후 재구성
+                childRegs.forEach { it.remove() }
+                childRegs.clear()
+
+                if (snap == null || snap.isEmpty) {
+                    // 다른 루트가 채워줄 수 있으니 여기선 비우지 않음
+                    return@addSnapshotListener
+                }
+
+                val allRows = mutableListOf<NotiLogRow>()
+
+                snap.documents.forEach { sessDoc ->
+                    val recs = sessDoc.reference.collection("records")
+
+                    // ALERT 전용
+                    val qAlert = recs.whereEqualTo("eventType", "ALERT")
+                        .limit(limitPerSession)
+
+                    val reg1 = qAlert.addSnapshotListener { rs, e1 ->
+                        if (e1 != null) {
+                            Log.w(TAG, "records(alert/eventType) listen error", e1)
+                            return@addSnapshotListener
+                        }
+                        val rows1 = rs?.documents?.mapNotNull { toRow(it) } ?: emptyList()
+
+                        // 레거시(event == "ALERT")
+                        val qLegacy = recs.limit(200L)
+                        val reg2 = qLegacy.addSnapshotListener { rs2, e2 ->
+                            if (e2 != null) {
+                                Log.w(TAG, "records(legacy/event) listen error", e2)
+                                updateAndEmit(allRows, rows1) { snapshot -> trySend(snapshot) }
+                                return@addSnapshotListener
+                            }
+                            val legacy = rs2?.documents
+                                ?.mapNotNull { toRow(it) }
+                                ?.filter { it.eventType == "ALERT" || (it.alertType != null) }
+                                ?: emptyList()
+
+                            updateAndEmit(allRows, rows1 + legacy) { snapshot -> trySend(snapshot) }
+                        }
+                        childRegs.add(reg2)
+                    }
+                    childRegs.add(reg1)
                 }
             }
-
-            val reasons: List<String> = when (val r = data["reasons"]) {
-                is List<*> -> r.mapNotNull { it?.toString()?.trim() }.filter { it.isNotEmpty() }
-                is String  -> r.split(',', ';', '|', '、', '；').map { it.trim() }.filter { it.isNotEmpty() }
-                else -> emptyList()
-            }
-
-            fun num(name: String): Double? = when (val v = data[name]) {
-                is Number -> v.toDouble()
-                is String -> v.toDoubleOrNull()
-                else -> null
-            }
-
-            return NotiLogRow(
-                id = id,
-                hostIso = hostIso,
-                reasons = reasons,
-                ampRatio = num("AmpRatio"),
-                padMs = num("PAD") ?: num("PAD_ms"),
-                dSutMs = num("dSUT") ?: num("dSUT_ms")
-            )
+            sessionRegs.add(reg)
         }
 
-        fun emitMerged() {
-            val merged = (cache1 + cache2)
-                .distinctBy { it.id }
-                .sortedByDescending { it.instantOrNull() }  // 최신 먼저
-            trySend(merged)
-        }
+        // 두 루트 모두 리슨 시작
+        roots.forEach { listenOnSessions(it) }
 
-        val r1 = qEventType.addSnapshotListener { snap, e ->
-            if (e != null) { Log.w(TAG, "qEventType err", e); trySend(emptyList()); return@addSnapshotListener }
-            cache1 = snap?.documents.orEmpty().mapNotNull { toRow(it.id, it.data) }
-            emitMerged()
+        awaitClose {
+            sessionRegs.forEach { it.remove() }
+            childRegs.forEach { it.remove() }
+            childRegs.clear()
         }
-        val r2 = qEvent.addSnapshotListener { snap, e ->
-            if (e != null) { Log.w(TAG, "qEvent err", e); trySend(emptyList()); return@addSnapshotListener }
-            cache2 = snap?.documents.orEmpty().mapNotNull { toRow(it.id, it.data) }
-            emitMerged()
-        }
-
-        awaitClose { r1.remove(); r2.remove() }
     }
+
+    // === 내부 상태 ===
+    private val childRegs = mutableListOf<ListenerRegistration>()
+    private val lock = Any()
+
+    private fun updateAndEmit(
+        acc: MutableList<NotiLogRow>,
+        incoming: List<NotiLogRow>,
+        trySendFn: (List<NotiLogRow>) -> Unit
+    ) {
+        synchronized(lock) {
+            val map = (acc + incoming).associateBy { it.id }
+            val merged = map.values
+                .filter { it.eventType == "ALERT" || (it.alertType != null) }
+                .sortedByDescending { it.epochMs ?: 0L }
+
+            acc.clear()
+            acc.addAll(merged)
+            trySendFn(acc.toList())
+        }
+    }
+
+    private val SID_FMT = DateTimeFormatter.ofPattern("'S_'yyyyMMdd'_'HHmmss'_'")
+    private val KST: ZoneId = ZoneId.of("Asia/Seoul")
+
+    private fun epochFromSessionIdOrNull(doc: DocumentSnapshot): Long? {
+        // sessions/{sid}/records/{rid} → sid 파싱
+        val sid = doc.reference.parent.parent?.id ?: return null
+        // 기대형식: S_yyyyMMdd_HHmmss_XXXX
+        // 앞 18글자까지가 패턴 'S_' + 8 + '_' + 6 + '_' = 18
+        if (sid.length < 18) return null
+        val head = sid.substring(0, 18) // ex) S_20250924_154514_
+        return runCatching {
+            LocalDateTime.parse(head, SID_FMT).atZone(KST).toInstant().toEpochMilli()
+        }.getOrNull()
+    }
+
+    private fun ratioOrNull(a: Double?, b: Double?): Double? {
+        if (a == null || b == null) return null
+        val lo = minOf(a, b)
+        val hi = maxOf(a, b)
+        if (hi == 0.0) return null
+        return lo / hi
+    }
+
+    private fun toRow(doc: DocumentSnapshot): NotiLogRow? {
+        val eventType = (doc.getString("eventType") ?: doc.getString("event"))?.uppercase()
+        val alertType = doc.getString("alert_type") ?: doc.getString("alertType")
+
+        // 시간 계열
+        val epochMs: Long? = when {
+            doc.contains("epochMs") -> doc.getLong("epochMs")
+            doc.contains("server_ts") -> doc.getTimestamp("server_ts")?.toDate()?.time
+            else -> epochFromSessionIdOrNull(doc)                     // ⭐ 세션ID로 복원
+        }
+
+        // hostIso가 빈 문자열이면 null 취급
+        val hostIsoRaw = doc.getString("hostIso") ?: doc.getString("host_time_iso")
+        val hostIso = hostIsoRaw?.takeIf { it.isNotBlank() }
+
+        // 숫자 키들
+        fun dbl(key: String): Double? =
+            (doc.getDouble(key)
+                ?: doc.getLong(key)?.toDouble()
+                ?: doc.getString(key)?.toDoubleOrNull())
+
+        val ampL = dbl("ampL")
+        val ampR = dbl("ampR")
+        val ampRatio = dbl("AmpRatio") ?: dbl("ampRatio") ?: ratioOrNull(ampL, ampR) // ⭐ 계산
+
+        val dSutMs = dbl("dSUT_ms") ?: dbl("dSUT")
+        ?: run {
+            val sutL = dbl("SUTL_ms") ?: dbl("SUTL")
+            val sutR = dbl("SUTR_ms") ?: dbl("SUTR")
+            if (sutL != null && sutR != null) kotlin.math.abs(sutL - sutR) else null
+        }
+
+        val reasons: List<String>? = when (val r = doc.get("reasons")) {
+            is List<*> -> r.mapNotNull { it?.toString() }
+            else -> doc.getString("reason")?.let { listOf(it) }
+        }
+
+        return NotiLogRow(
+            id        = doc.id,
+            epochMs   = epochMs,
+            hostIso   = hostIso,
+            eventType = eventType,
+            alertType = alertType,
+            side      = doc.getString("side"),
+            reasons   = reasons,
+            ampRatio  = ampRatio,
+            padMs     = dbl("PAD_ms") ?: dbl("PAD") ?: dbl("padMs"),
+            dSutMs    = dSutMs
+        )
+    }
+
 }
