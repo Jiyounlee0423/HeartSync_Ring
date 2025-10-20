@@ -124,7 +124,7 @@ class MeasureService : Service() {
             }
     }
 
-//    private fun parseSmoothed(line: String): Pair<Float, Float>? {
+    //    private fun parseSmoothed(line: String): Pair<Float, Float>? {
 //        fun num(key: String): Float? =
 //            Regex("""\b${key}=([-\d.]+)""").find(line)?.groupValues?.getOrNull(1)?.toFloatOrNull()
 //
@@ -250,13 +250,13 @@ class MeasureService : Service() {
                     else -> "대기"
                 }
                 when (st) {
-                is PpgBleClient.ConnectionState.Failed -> {
-                    Log.e("MeasureService", "BLE FAIL reason=${st.reason}")
-                }
+                    is PpgBleClient.ConnectionState.Failed -> {
+                        Log.e("MeasureService", "BLE FAIL reason=${st.reason}")
+                    }
                     else -> {
                     }
 
-            }
+                }
                 val n = NotificationCompat.Builder(this@MeasureService, NOTI_CHANNEL_ID)
                     .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
                     .setContentTitle("측정 중")
