@@ -203,22 +203,17 @@ class MainActivity : ComponentActivity() {
             navigation(startDestination = Route.Home, route = Route.MAIN) {
 
                 composable(Route.Home) {
-                    RequireAuth(navController) {
-                        HomeScreen(
-                            onClickBle = { navController.navigate(Route.BLE_CONNECT) },
-                            bleVm = bleVm,
-                            onStartMeasure = {
-                                navController.navigate(Route.Measure)
-                            }
-                        )
-                    }
+                    HomeScreen(
+                        onClickBle = { navController.navigate(Route.BLE_CONNECT) },
+                        onStartMeasure = { navController.navigate(Route.Measure) }
+                    )
                 }
 
                 composable(Route.BLE_CONNECT) {
                     RequireAuth(navController) {
                         BleConnectScreen(
                             vm = bleVm,
-                            onConnected = { navController.popBackStack() }
+                            onDone = { navController.popBackStack() }
                         )
                     }
                 }

@@ -11,17 +11,18 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.heartsync.ble.PpgBleClient
-import com.example.heartsync.viewmodel.BleViewModel
+import androidx.lifecycle.viewModelScope
 import com.example.heartsync.ui.components.StatusCard
 import com.example.heartsync.data.remote.PpgPoint
 import com.example.heartsync.data.remote.PpgRepository
@@ -32,54 +33,88 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.time.LocalDate
 import java.util.*
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import com.example.heartsync.viewmodel.RxStats
+
+// === DualRing (좌/우 링 동시 수신 + 20ms 동기화) ===
+import com.example.heartsync.viewmodel.DualRingViewModel
+import com.example.heartsync.signal.SyncedPoint
 
 // --------------------------- Screen ---------------------------
 
 @Composable
 fun HomeScreen(
-    onClickBle: () -> Unit,
-    bleVm: BleViewModel,
+    onClickBle: () -> Unit,             // 스캔/연결 화면으로 이동 콜백
     onStartMeasure: () -> Unit,
     vm: HomeViewModel = viewModel(
         factory = HomeVmFactory(PpgRepository(FirebaseFirestore.getInstance()))
-    )
+    ),
+    dualVm: DualRingViewModel = viewModel()
 ) {
     val scroll = rememberScrollState()
 
-    val conn by bleVm.connectionState.collectAsStateWithLifecycle()
-    val isConnected = conn is PpgBleClient.ConnectionState.Connected
-    val deviceName = (conn as? PpgBleClient.ConnectionState.Connected)?.device?.name ?: "Unknown"
+    // DualRing 연결 상태/포인트
+    val connStates by dualVm.connStates.collectAsStateWithLifecycle()
+    val syncedPoints by dualVm.points.collectAsStateWithLifecycle()
 
-    // ALERT 팝업 상태
-    var currentAlert by remember { mutableStateOf<PpgRepository.UiAlert?>(null) }
-    LaunchedEffect(Unit) {
-        bleVm.alerts.collect { a ->
-            currentAlert = a
-            launch {
-                kotlinx.coroutines.delay(4000)
-                if (currentAlert === a) currentAlert = null
+    // 좌/우 연결 여부 & 이름 라벨
+    val leftState  = connStates["left"]
+    val rightState = connStates["right"]
+    val isLeftConn  = leftState?.toString()?.startsWith("Connected") == true
+    val isRightConn = rightState?.toString()?.startsWith("Connected") == true
+    val isConnected = isLeftConn && isRightConn
+
+    fun labelOf(stateAny: Any?): String {
+        val s = stateAny?.toString() ?: return "—"
+        return when {
+            s.startsWith("Connected") -> {
+                val name = Regex("name=([^,\\)]*)").find(s)?.groupValues?.getOrNull(1) ?: "Connected"
+                name
+            }
+            s.startsWith("Reconnecting") -> "Reconnecting"
+            s.startsWith("Disconnected") -> "Disconnected"
+            else -> s
+        }
+    }
+    val leftName  = labelOf(leftState)
+    val rightName = labelOf(rightState)
+
+    // 로그인/데이터
+    val isLoggedIn by vm.isLoggedIn.collectAsStateWithLifecycle()
+    val today by vm.today.collectAsStateWithLifecycle()
+    val live by vm.live.collectAsStateWithLifecycle()
+
+    // DualRing → PpgPoint 변환 (벽시계 ms 라벨용)
+    val liveFromDual by remember(syncedPoints) {
+        derivedStateOf {
+            val latestMono = syncedPoints.lastOrNull()?.tMonoS ?: 0.0
+            val nowMs = System.currentTimeMillis()
+            fun wallMillis(p: SyncedPoint): Long {
+                val ageSec = latestMono - p.tMonoS
+                return (nowMs - (ageSec * 1000.0)).toLong()
+            }
+            syncedPoints.map { sp ->
+                PpgPoint(
+                    time = wallMillis(sp),
+                    left = sp.left.toDouble(),
+                    right = sp.right.toDouble(),
+                    serverTime = wallMillis(sp)
+                )
             }
         }
     }
 
-    LaunchedEffect(isConnected) {
-        vm.onBleConnectionChanged(isConnected)
-    }
+    // 실시간 리스트 주입
+    LaunchedEffect(liveFromDual) { vm.replaceLive(liveFromDual) }
 
-    val isLoggedIn by vm.isLoggedIn.collectAsStateWithLifecycle()
-    val live by vm.live.collectAsStateWithLifecycle()
+    // 표시 데이터(실시간 우선)
     val pointsDisplay by vm.display.collectAsStateWithLifecycle()
 
     var window by rememberSaveable { mutableStateOf(150) }
+    LaunchedEffect(isConnected) { vm.onBleConnectionChanged(isConnected) }
+
+    // 생명주기: DualRing 스트리밍 on/off
+    LaunchedEffect(Unit) { dualVm.start() }
+    DisposableEffect(Unit) { onDispose { dualVm.stop() } }
 
     Column(
         modifier = Modifier
@@ -92,9 +127,14 @@ fun HomeScreen(
 
         StatusCard(
             icon = if (isConnected) "success" else "error",
-            title = if (isConnected) "연결됨: $deviceName" else "기기 연결이 필요합니다.",
-            buttonText = if (isConnected) "연결 해제" else "기기 연결",
-            onClick = { if (isConnected) bleVm.disconnect() else onClickBle() },
+            title = if (isConnected)
+                "연결됨: L=$leftName / R=$rightName"
+            else
+                "두 기기 연결이 필요합니다.",
+            buttonText = if (isConnected) "BLE 상세" else "스캔/연결",
+            onClick = {
+                onClickBle()                        // 스캔/연결 화면으로 이동
+            },
             modifier = Modifier
                 .fillMaxWidth()
                 .height(90.dp),
@@ -109,6 +149,9 @@ fun HomeScreen(
             overflow = TextOverflow.Ellipsis
         )
 
+        val stats by dualVm.rxStats.collectAsStateWithLifecycle()
+        LiveStatus(stats = stats)
+
         if (!isLoggedIn) {
             Box(
                 Modifier
@@ -118,12 +161,7 @@ fun HomeScreen(
             ) { Text("로그인이 필요합니다.") }
         } else {
             val last = pointsDisplay.lastOrNull()
-            val sourceLabel = if (live.isNotEmpty() && isConnected) "실시간(BLE)" else "기록(Firebase)"
-
-            val twoLineMinHeight = with(LocalDensity.current) {
-                // bodyMedium의 lineHeight × 2줄 × 여유계수(1.1~1.2)
-                (MaterialTheme.typography.bodyMedium.lineHeight * 2f * 1.15f).toDp()
-            }
+            val sourceLabel = if (live.isNotEmpty() && isConnected) "실시간(BLE: DualRing)" else "기록(Firebase)"
 
             HeaderRow(
                 pointsDisplaySize = pointsDisplay.size,
@@ -161,31 +199,9 @@ fun HomeScreen(
             Text("측정 시작(반응성 충혈 test)")
         }
     }
-
-    // ALERT 팝업
-    currentAlert?.let { a ->
-        val sideKo = if (a.side.equals("left", true)) "왼쪽" else "오른쪽"
-        val title = when (a.alertType?.uppercase()) {
-            "FLOW_IMBALANCE" -> "혈류 불균형 감지"
-            "HR_ABNORMAL"    -> "심박 이상 감지"
-            else             -> "이상 감지"
-        }
-        val body = buildString {
-            append("${sideKo}에서 이상이 감지되었어요.")
-            if (!a.alertType.isNullOrBlank()) append("\n유형: ${a.alertType}")
-            if (a.reasons.isNotEmpty()) append("\n사유: ${a.reasons.joinToString(", ")}")
-        }
-
-        AlertDialog(
-            onDismissRequest = { currentAlert = null },
-            title = { Text(title) },
-            text  = { Text(body) },
-            confirmButton = {
-                TextButton(onClick = { currentAlert = null }) { Text("확인") }
-            }
-        )
-    }
 }
+
+// --------------------------- Header ---------------------------
 
 @Composable
 fun HeaderRow(
@@ -195,12 +211,9 @@ fun HeaderRow(
     lastRight: Double?
 ) {
     val density = LocalDensity.current
-
-    // 2줄 기준 최소 높이(Dp) 계산: bodyMedium lineHeight × 2줄 × 여유계수
     val twoLineMinHeight = with(density) {
         (MaterialTheme.typography.bodyMedium.lineHeight.value * 2f * 1.15f).sp.toDp()
     }
-    // 마지막 Text의 라인 간격(원하는 값으로 살짝 여유를 줌)
     val compactLineHeight = (MaterialTheme.typography.bodyMedium.lineHeight.value * 1.2f).sp
 
     Row(
@@ -210,7 +223,6 @@ fun HeaderRow(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // 좌측: 샘플 수 (1줄 고정)
         Text(
             text = "샘플 수: $pointsDisplaySize",
             modifier = Modifier.weight(1f),
@@ -219,8 +231,6 @@ fun HeaderRow(
             overflow = TextOverflow.Ellipsis,
             style = MaterialTheme.typography.bodyMedium
         )
-
-        // 중앙: 소스 라벨 (1줄 고정)
         Text(
             text = sourceLabel,
             modifier = Modifier.weight(1f),
@@ -230,8 +240,6 @@ fun HeaderRow(
             overflow = TextOverflow.Ellipsis,
             style = MaterialTheme.typography.labelLarge
         )
-
-        // 우측: 항상 2줄(제목/값) 고정
         Text(
             text = buildAnnotatedString {
                 append("최근 L/R:")
@@ -244,7 +252,7 @@ fun HeaderRow(
             modifier = Modifier.weight(1f),
             textAlign = TextAlign.End,
             minLines = 2,
-            maxLines = 2,           // 정확히 2줄
+            maxLines = 2,
             softWrap = true,
             overflow = TextOverflow.Clip,
             style = MaterialTheme.typography.bodyMedium.merge(
@@ -279,6 +287,7 @@ private fun DateChip() {
 class HomeViewModel(
     private val repo: PpgRepository
 ) : ViewModel() {
+
     private val _today = MutableStateFlow<List<PpgPoint>>(emptyList())
     val today: StateFlow<List<PpgPoint>> = _today.asStateFlow()
 
@@ -288,6 +297,7 @@ class HomeViewModel(
     private val _isLoggedIn = MutableStateFlow(false)
     val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
 
+    // 표시용: 실시간이 있으면 실시간, 없으면 당일 기록
     val display: StateFlow<List<PpgPoint>> =
         combine(today, live) { day, livePts ->
             if (livePts.isNotEmpty()) livePts else day
@@ -301,21 +311,15 @@ class HomeViewModel(
                 repo.observeDayPpg(uid, LocalDate.now())
                     .collectLatest { _today.value = it }
             }
-            viewModelScope.launch {
-                PpgRepository.smoothedFlow.collect { (t, l, r) ->
-                    addLivePoint(t, l, r)
-                }
-            }
         }
     }
 
+    /** HomeScreen에서 DualRing 실시간 동기 포인트를 PpgPoint로 변환해 넣어준다 */
+    fun replaceLive(points: List<PpgPoint>) { _live.value = points }
+
+    /** 연결 끊기면 실시간 비우기 */
     fun onBleConnectionChanged(connected: Boolean) {
         if (!connected) _live.value = emptyList()
-    }
-
-    private fun addLivePoint(timeMillis: Long, l: Float, r: Float) {
-        val newPt = PpgPoint(timeMillis, l.toDouble(), r.toDouble(), timeMillis)
-        _live.update { cur -> (if (cur.size >= 1000) cur.drop(cur.size - 999) else cur) + newPt }
     }
 }
 
@@ -432,5 +436,32 @@ fun HomeGraphSection(
                 Text(text = label, style = MaterialTheme.typography.labelSmall)
             }
         }
+    }
+}
+
+@Composable
+private fun LiveStatus(stats: RxStats) {
+    val leftOk  = stats.leftHz  > 0.5
+    val rightOk = stats.rightHz > 0.5
+    val text = buildString {
+        append("입력속도: L=${"%.1f".format(stats.leftHz)} Hz / R=${"%.1f".format(stats.rightHz)} Hz")
+        append("   (지연: L=")
+        append(if (stats.lastLeftAgoMs == Long.MAX_VALUE) "-" else "${stats.lastLeftAgoMs}ms")
+        append(", R=")
+        append(if (stats.lastRightAgoMs == Long.MAX_VALUE) "-" else "${stats.lastRightAgoMs}ms")
+        append(")")
+    }
+    val color = when {
+        leftOk && rightOk -> MaterialTheme.colorScheme.primary
+        !leftOk && !rightOk -> MaterialTheme.colorScheme.error
+        else -> MaterialTheme.colorScheme.tertiary
+    }
+    Surface(tonalElevation = 2.dp, shape = MaterialTheme.shapes.small) {
+        Text(
+            text,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+            color = color,
+            style = MaterialTheme.typography.labelLarge
+        )
     }
 }
