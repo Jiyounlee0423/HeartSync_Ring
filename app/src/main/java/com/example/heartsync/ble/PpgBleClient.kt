@@ -9,23 +9,25 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelUuid
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.heartsync.data.model.BleDevice
+import com.example.heartsync.data.remote.PpgRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
-import com.example.heartsync.data.remote.PpgRepository
 import java.nio.charset.StandardCharsets
+import java.util.UUID
+import java.util.concurrent.LinkedBlockingQueue
 
 /**
  * HeartSync BLE 클라이언트
  * - GATT 133 회피: 연결 순서 (discover → MTU → CCCD)
+ * - 안전 종료(safeDisconnect): CCCD OFF → disconnect → close
  */
 class PpgBleClient(
     private val ctx: Context,
@@ -70,8 +72,7 @@ class PpgBleClient(
     private val descriptorQueue = LinkedBlockingQueue<BluetoothGattDescriptor>()
     private var scanCallback: ScanCallback? = null
 
-
-    // 라인 프레이머 (Notify 조각 -> 개행 단위)
+    // ===== 라인 프레이머 (Notify 조각 -> 개행 단위) =====
     private val lineBuf = StringBuilder()
     private fun StringBuilder.indexOfAny(chars: CharArray): Int {
         for (i in 0 until this.length) {
@@ -92,18 +93,15 @@ class PpgBleClient(
         while (i < src.length) {
             val ch = src[i]
             if (ch == '-' || ch == '.' || (ch in '0'..'9')) {
-                sb.append(ch)
-                i++
+                sb.append(ch); i++
             } else break
         }
         return sb.toString().toDoubleOrNull()
     }
 
     private fun feedBytesAndEmitLines(bytes: ByteArray) {
-        // ★ String 생성자 모호성 회피: java.nio.charset.StandardCharsets 사용
         val s = try { String(bytes, StandardCharsets.UTF_8) } catch (_: Exception) { return }
         lineBuf.append(s)
-
         val delims = charArrayOf('\n', '\r')
 
         while (true) {
@@ -114,22 +112,9 @@ class PpgBleClient(
             lineBuf.delete(0, idx + 1)
             if (oneLine.isEmpty()) continue
 
-//            // ★ 즉시 그래프 반영 (Firestore 저장과 독립)
-//            val l = parseNumKV(oneLine, "PPGf_L") ?: parseNumKV(oneLine, "PPG_L")
-//            val r = parseNumKV(oneLine, "PPGf_R") ?: parseNumKV(oneLine, "PPG_R")
-//            if (l != null && r != null) {
-//                PpgRepository.emitSmoothed(l, r)
-//            }
-
-
-            // 기록용 저장 (IO 스코프에서)
             if (oneLine.startsWith("STAT") || oneLine.startsWith("ALERT")) {
-                repoScope.launch {
-                    com.example.heartsync.data.remote.PpgRepository.trySaveFromLine(oneLine)
-                }
+                repoScope.launch { PpgRepository.trySaveFromLine(oneLine) }
             }
-
-            // UI 로그 전달
             onLine(oneLine)
         }
 
@@ -138,15 +123,11 @@ class PpgBleClient(
             val oneLine = lineBuf.toString().trim()
             lineBuf.clear()
             if (oneLine.isNotEmpty()) {
-                val l = parseNumKV(oneLine, "PPGf_L") ?: parseNumKV(oneLine, "PPG_L")
-                val r = parseNumKV(oneLine, "PPGf_R") ?: parseNumKV(oneLine, "PPG_R")
                 repoScope.launch { PpgRepository.trySaveFromLine(oneLine) }
                 onLine(oneLine)
             }
         }
     }
-
-
 
     // 재시도용
     private var targetDevice: BleDevice? = null
@@ -213,6 +194,41 @@ class PpgBleClient(
         scanCallback = null
     }
 
+    // ===== 안전 종료 (핵심) =====
+    @SuppressLint("MissingPermission")
+    fun safeDisconnect() {
+        val g = gatt ?: return
+        try { disableAllNotifiesAndCccd(g) } catch (_: Throwable) { /* best-effort */ }
+        try { g.disconnect() } catch (_: Exception) {}
+        try { g.close() } catch (_: Exception) {}
+        gatt = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun disableAllNotifiesAndCccd(g: BluetoothGatt) {
+        val svc = g.getService(serviceUuid)
+        val chars: List<BluetoothGattCharacteristic> = when {
+            svc != null -> notifyCharUuids.mapNotNull { svc.getCharacteristic(it) }
+            else -> g.services.orEmpty().flatMap { it.characteristics.orEmpty() }
+                .filter { it.uuid in notifyCharUuids }
+        }
+        for (ch in chars) {
+            runCatching { g.setCharacteristicNotification(ch, false) }
+            ch.getDescriptor(cccdUuid)?.let { cccd ->
+                if (Build.VERSION.SDK_INT >= 33) {
+                    runCatching { g.writeDescriptor(cccd, BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE) }
+                } else {
+                    @Suppress("DEPRECATION")
+                    runCatching {
+                        cccd.value = BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+                        g.writeDescriptor(cccd)
+                    }
+                }
+                SystemClock.sleep(40) // 디스크립터 반영 대기
+            }
+        }
+    }
+
     // ===== Connect / Disconnect =====
     @SuppressLint("MissingPermission")
     fun connect(device: BleDevice) {
@@ -241,16 +257,13 @@ class PpgBleClient(
     @SuppressLint("MissingPermission")
     fun disconnect() {
         Log.d("BLE", "disconnect()")
-        closeGatt()
+        safeDisconnect()
         _connectionState.value = ConnectionState.Disconnected
     }
 
     @SuppressLint("MissingPermission")
     private fun closeGatt() {
-        if (!hasConnectPerm()) {
-            gatt = null
-            return
-        }
+        if (!hasConnectPerm()) { gatt = null; return }
         try { gatt?.disconnect() } catch (_: Exception) {}
         try { gatt?.close() } catch (_: Exception) {}
         gatt = null
@@ -414,5 +427,4 @@ class PpgBleClient(
             onError("Descriptor write 권한 오류")
         }
     }
-
 }

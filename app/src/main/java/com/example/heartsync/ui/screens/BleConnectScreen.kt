@@ -1,8 +1,9 @@
-// app/src/main/java/com/example/heartsync/ui/screens/BleConnectScreen.kt
 package com.example.heartsync.ui.screens
 
 import android.Manifest
+import android.content.Intent
 import android.os.Build
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -24,10 +25,9 @@ import com.example.heartsync.data.model.BleDevice
 import com.example.heartsync.ui.components.StatusCard
 import com.example.heartsync.viewmodel.BleViewModel
 import com.example.heartsync.data.DevicePrefs
-
-// DualRing 상태 확인
 import com.example.heartsync.viewmodel.DualRingViewModel
 import com.example.heartsync.ble.ConnState
+import com.example.heartsync.service.MeasureService
 
 @Composable
 fun BleConnectScreen(
@@ -43,16 +43,19 @@ fun BleConnectScreen(
     val ctx   = LocalContext.current
     val prefs = remember { DevicePrefs(ctx) }
     val scope = rememberCoroutineScope()
+    val snackbar = remember { SnackbarHostState() }
 
     val leftMac  by prefs.leftMac.collectAsStateWithLifecycle(initialValue = null)
     val rightMac by prefs.rightMac.collectAsStateWithLifecycle(initialValue = null)
 
-    // DualRing 연결상태
     val ringStates by dualVm.connStates.collectAsStateWithLifecycle(initialValue = emptyMap())
+    val events by vm.events.collectAsState(initial = null)
 
-    val snackbar = remember { SnackbarHostState() }
+    // toast for events
+    LaunchedEffect(events) {
+        events?.let { Toast.makeText(ctx, it, Toast.LENGTH_SHORT).show() }
+    }
 
-    // 권한 런처
     val requiredPerms = remember {
         val list = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= 31) {
@@ -65,9 +68,8 @@ fun BleConnectScreen(
     }
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* no-op */ }
+    ) { }
 
-    // 화면 진입 시 DualRing 연결 시도
     LaunchedEffect(Unit) { dualVm.start() }
 
     Scaffold(
@@ -81,8 +83,6 @@ fun BleConnectScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-
-            // ── 스캔/상태 카드: 스캔 플래그에 따라 제목/버튼을 즉시 반영 ──
             val title = when {
                 scanning -> "스캔 중…"
                 conn is PpgBleClient.ConnectionState.Failed ->
@@ -103,7 +103,7 @@ fun BleConnectScreen(
                 }
             )
 
-            // ── 지정된 기기 요약 (이름만 표시 / 주소 숨김) ──
+            // 지정된 기기 상태 요약
             Surface(tonalElevation = 2.dp, shape = MaterialTheme.shapes.medium) {
                 Column(Modifier.fillMaxWidth().padding(12.dp)) {
                     Text("지정된 기기", fontWeight = FontWeight.Bold)
@@ -111,15 +111,24 @@ fun BleConnectScreen(
 
                     val leftState  = connStates["left"]
                     val rightState = connStates["right"]
-                    val leftStatus  = when (leftState) {
-                        is ConnState.Connected -> "연결됨 (${leftState.name ?: "Unknown"})"
-                        is ConnState.Reconnecting -> "재연결 중"
+                    val leftStatus = when (val s = leftState) {
+                        is ConnState.Connected    -> "연결됨 (${s.name ?: "Unknown"})"
+                        is ConnState.Reconnecting -> {
+                            val who = s.name?.takeIf { it.isNotBlank() } ?: ""
+                            "재연결 중${if (s.attempt > 1) " #${s.attempt}" else ""}" +
+                                    (if (who.isNotBlank()) " ($who)" else "")
+                        }
                         is ConnState.Disconnected -> "끊김"
                         else -> if (leftMac != null) "등록됨" else "미지정"
                     }
-                    val rightStatus = when (rightState) {
-                        is ConnState.Connected -> "연결됨 (${rightState.name ?: "Unknown"})"
-                        is ConnState.Reconnecting -> "재연결 중"
+
+                    val rightStatus = when (val s = rightState) {
+                        is ConnState.Connected    -> "연결됨 (${s.name ?: "Unknown"})"
+                        is ConnState.Reconnecting -> {
+                            val who = s.name?.takeIf { it.isNotBlank() } ?: ""
+                            "재연결 중${if (s.attempt > 1) " #${s.attempt}" else ""}" +
+                                    (if (who.isNotBlank()) " ($who)" else "")
+                        }
                         is ConnState.Disconnected -> "끊김"
                         else -> if (rightMac != null) "등록됨" else "미지정"
                     }
@@ -129,7 +138,6 @@ fun BleConnectScreen(
                 }
             }
 
-            // ── 스캔 리스트 (남은 공간 스크롤) ──
             DeviceSelectList(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -138,14 +146,35 @@ fun BleConnectScreen(
                 items = results,
                 leftMac = leftMac,
                 rightMac = rightMac,
-                onPickLeft  = { dev -> scope.launch { prefs.setLeft(dev.address) } },
-                onPickRight = { dev -> scope.launch { prefs.setRight(dev.address) } }
+                onPickLeft  = { dev ->
+                    if (vm.onSelectLeft(dev)) scope.launch { prefs.setLeft(dev.address) }
+                },
+                onPickRight = { dev ->
+                    if (vm.onSelectRight(dev)) scope.launch { prefs.setRight(dev.address) }
+                }
             )
 
-            // ── 하단 액션 ──
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
                 OutlinedButton(
-                    onClick = { scope.launch { prefs.clear() } },
+                    onClick = {
+                        scope.launch {
+                            // 1) 저장된 좌/우 MAC 제거
+                            prefs.clear()
+
+                            // 2) 듀얼 클라이언트: 두 센서 동시 안전 분리
+                            dualVm.resetAll()
+
+                            // 3) (단일 모드 측정 서비스가 살아있다면) 강제 리셋
+                            val intent = Intent(ctx, MeasureService::class.java)
+                                .setAction(MeasureService.ACTION_RESET_ALL)
+                            ctx.startService(intent)
+
+                            snackbar.showSnackbar("블루투스 연결을 초기화했어요.")
+                        }
+                    },
                     modifier = Modifier.weight(1f).height(48.dp)
                 ) { Text("초기화") }
 
@@ -156,8 +185,7 @@ fun BleConnectScreen(
                         when {
                             leftMac == null || rightMac == null ->
                                 scope.launch { snackbar.showSnackbar("왼손/오른손을 모두 지정하세요.") }
-                            leftOk && rightOk ->
-                                onDone?.invoke()
+                            leftOk && rightOk -> onDone?.invoke()
                             else -> {
                                 val failSides = buildList {
                                     if (!leftOk) add("왼손")
@@ -200,7 +228,7 @@ private fun DeviceSelectList(
                     ) {
                         Text("발견된 장치 (${items.size})", fontWeight = FontWeight.Bold)
                         Spacer(Modifier.weight(1f))
-                        Text("항목에서 왼/오 버튼으로 지정", style = MaterialTheme.typography.labelMedium)
+                        Text("왼/오 버튼으로 지정", style = MaterialTheme.typography.labelMedium)
                     }
                 }
             }
@@ -216,13 +244,15 @@ private fun DeviceSelectList(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text(dev.name ?: "Unknown", style = MaterialTheme.typography.bodyMedium, maxLines = 1)
-                        Text(dev.address, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+                        Text(dev.name ?: "Unknown", style = MaterialTheme.typography.bodyMedium)
+                        Text(dev.address, style = MaterialTheme.typography.bodySmall)
                     }
                     Spacer(Modifier.width(8.dp))
-                    AssistChip(onClick = { onPickLeft(dev) },  label = { Text(if (isLeftSel) "왼손 ✓" else "왼손") })
+                    AssistChip(onClick = { onPickLeft(dev) },
+                        label = { Text(if (isLeftSel) "왼손 ✓" else "왼손") })
                     Spacer(Modifier.width(6.dp))
-                    AssistChip(onClick = { onPickRight(dev) }, label = { Text(if (isRightSel) "오른손 ✓" else "오른손") })
+                    AssistChip(onClick = { onPickRight(dev) },
+                        label = { Text(if (isRightSel) "오른손 ✓" else "오른손") })
                 }
                 HorizontalDivider(thickness = 0.6.dp)
             }

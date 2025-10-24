@@ -1,4 +1,3 @@
-// app/src/main/java/com/example/heartsync/ui/screens/HomeScreen.kt
 package com.example.heartsync.ui.screens
 
 import androidx.compose.foundation.Canvas
@@ -35,9 +34,8 @@ import java.time.LocalDate
 import java.util.*
 import com.example.heartsync.viewmodel.RxStats
 
-// === DualRing (좌/우 링 동시 수신 + 20ms 동기화) ===
+// === DualRing (좌/우 링 동시 수신) ===
 import com.example.heartsync.viewmodel.DualRingViewModel
-import com.example.heartsync.signal.SyncedPoint
 
 // --------------------------- Screen ---------------------------
 
@@ -52,16 +50,16 @@ fun HomeScreen(
 ) {
     val scroll = rememberScrollState()
 
-    // DualRing 연결 상태/포인트
+    // DualRing 연결 상태/ppgf 스트림
     val connStates by dualVm.connStates.collectAsStateWithLifecycle()
-    val syncedPoints by dualVm.points.collectAsStateWithLifecycle()
+    val leftPpgf  by dualVm.ppgfLeft.collectAsStateWithLifecycle()
+    val rightPpgf by dualVm.ppgfRight.collectAsStateWithLifecycle()
+    val bothConnected by dualVm.bothConnected.collectAsStateWithLifecycle()
 
     // 좌/우 연결 여부 & 이름 라벨
     val leftState  = connStates["left"]
     val rightState = connStates["right"]
-    val isLeftConn  = leftState?.toString()?.startsWith("Connected") == true
-    val isRightConn = rightState?.toString()?.startsWith("Connected") == true
-    val isConnected = isLeftConn && isRightConn
+    val isConnected = bothConnected
 
     fun labelOf(stateAny: Any?): String {
         val s = stateAny?.toString() ?: return "—"
@@ -83,22 +81,36 @@ fun HomeScreen(
     val today by vm.today.collectAsStateWithLifecycle()
     val live by vm.live.collectAsStateWithLifecycle()
 
-    // DualRing → PpgPoint 변환 (벽시계 ms 라벨용)
-    val liveFromDual by remember(syncedPoints) {
+    // ====== ppgf(좌/우) → PpgPoint 변환 (벽시계 ms 라벨) ======
+    // 좌/우 리스트 길이가 다를 수 있어 공통 길이(min) 기준으로 정렬/매핑
+    val liveFromDual by remember(leftPpgf, rightPpgf) {
         derivedStateOf {
-            val latestMono = syncedPoints.lastOrNull()?.tMonoS ?: 0.0
-            val nowMs = System.currentTimeMillis()
-            fun wallMillis(p: SyncedPoint): Long {
-                val ageSec = latestMono - p.tMonoS
-                return (nowMs - (ageSec * 1000.0)).toLong()
-            }
-            syncedPoints.map { sp ->
-                PpgPoint(
-                    time = wallMillis(sp),
-                    left = sp.left.toDouble(),
-                    right = sp.right.toDouble(),
-                    serverTime = wallMillis(sp)
-                )
+            if (leftPpgf.isEmpty() || rightPpgf.isEmpty()) emptyList<PpgPoint>()
+            else {
+                val n = minOf(leftPpgf.size, rightPpgf.size)
+                val lTail = leftPpgf.takeLast(n)
+                val rTail = rightPpgf.takeLast(n)
+
+                // 최신 모노토닉 기준으로 벽시계 변환
+                val latestMono = maxOf(lTail.last().first, rTail.last().first).toDouble()
+                val nowMs = System.currentTimeMillis()
+                fun wallMillis(tMono: Float): Long {
+                    val ageSec = latestMono - tMono
+                    return (nowMs - (ageSec * 1000.0)).toLong()
+                }
+
+                // 인덱스 정렬 가정(동일 다운샘플 속도) — 좌/우 같은 인덱스끼리 묶음
+                lTail.indices.map { i ->
+                    val (tL, yL) = lTail[i]
+                    val (_,  yR) = rTail[i]
+                    val ts = wallMillis(tL)
+                    PpgPoint(
+                        time = ts,
+                        left = yL.toDouble(),
+                        right = yR.toDouble(),
+                        serverTime = ts
+                    )
+                }
             }
         }
     }
@@ -132,9 +144,7 @@ fun HomeScreen(
             else
                 "두 기기 연결이 필요합니다.",
             buttonText = if (isConnected) "BLE 상세" else "스캔/연결",
-            onClick = {
-                onClickBle()                        // 스캔/연결 화면으로 이동
-            },
+            onClick = { onClickBle() },
             modifier = Modifier
                 .fillMaxWidth()
                 .height(90.dp),
@@ -143,7 +153,7 @@ fun HomeScreen(
         )
 
         Text(
-            "오늘의 실시간 PPG (Left / Right)",
+            "오늘의 실시간 PPG (Left / Right, ppgf: DC→MA)",
             style = MaterialTheme.typography.titleMedium,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
@@ -161,7 +171,7 @@ fun HomeScreen(
             ) { Text("로그인이 필요합니다.") }
         } else {
             val last = pointsDisplay.lastOrNull()
-            val sourceLabel = if (live.isNotEmpty() && isConnected) "실시간(BLE: DualRing)" else "기록(Firebase)"
+            val sourceLabel = if (live.isNotEmpty() && isConnected) "실시간(BLE: DualRing, ppgf)" else "기록(Firebase)"
 
             HeaderRow(
                 pointsDisplaySize = pointsDisplay.size,
@@ -181,7 +191,17 @@ fun HomeScreen(
                 }
             }
 
-            HomeGraphSection(points = pointsDisplay, window = window)
+            // ===== 그래프는 "양쪽 모두 연결"일 때만 표시 =====
+            if (isConnected) {
+                HomeGraphSection(points = pointsDisplay, window = window)
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(200.dp),
+                    contentAlignment = Alignment.Center
+                ) { Text("블루투스 양쪽 연결 시 그래프가 표시됩니다.") }
+            }
 
             Text(
                 "기록은 같은 날짜의 모든 세션(S_YYYYMMDD_*) records를 합쳐 시간순으로 표시합니다.",
@@ -314,7 +334,7 @@ class HomeViewModel(
         }
     }
 
-    /** HomeScreen에서 DualRing 실시간 동기 포인트를 PpgPoint로 변환해 넣어준다 */
+    /** HomeScreen에서 DualRing 실시간 ppgf를 PpgPoint로 변환해 넣어준다 */
     fun replaceLive(points: List<PpgPoint>) { _live.value = points }
 
     /** 연결 끊기면 실시간 비우기 */
