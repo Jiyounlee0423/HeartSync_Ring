@@ -23,6 +23,8 @@ import kotlinx.coroutines.launch
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
+import com.example.heartsync.ble.R02Proto
+
 
 /**
  * HeartSync BLE 클라이언트
@@ -188,6 +190,32 @@ class PpgBleClient(
     }
 
     @SuppressLint("MissingPermission")
+    private fun tryWriteDisable(g: BluetoothGatt) {
+        try {
+            // R02 UART Write 캐릭터리스틱 찾기
+            val svcList = g.services ?: return
+            var writeCh: BluetoothGattCharacteristic? = null
+            for (svc in svcList) {
+                val chs = svc.characteristics ?: continue
+                for (ch in chs) {
+                    if (ch.uuid == R02Proto.RXTX_WRITE) {
+                        writeCh = ch
+                        break
+                    }
+                }
+                if (writeCh != null) break
+            }
+            // 찾으면 DISABLE 전송 (A102 등 기기별 정의는 R02Proto.DISABLE)
+            writeCh?.let { ch ->
+                ch.value = R02Proto.DISABLE
+                g.writeCharacteristic(ch)
+            }
+        } catch (_: Throwable) {
+            // best-effort: 실패해도 하위 단계 진행
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     fun stopScan() {
         _scanning.value = false
         scanCallback?.let { scanner?.stopScan(it) }
@@ -198,7 +226,11 @@ class PpgBleClient(
     @SuppressLint("MissingPermission")
     fun safeDisconnect() {
         val g = gatt ?: return
-        try { disableAllNotifiesAndCccd(g) } catch (_: Throwable) { /* best-effort */ }
+        // 1) 스트리밍 중지 시도
+        try { tryWriteDisable(g) } catch (_: Throwable) {}
+        // 2) CCCD/notify 끄기
+        try { disableAllNotifiesAndCccd(g) } catch (_: Throwable) {}
+        // 3) 링크 종료
         try { g.disconnect() } catch (_: Exception) {}
         try { g.close() } catch (_: Exception) {}
         gatt = null

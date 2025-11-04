@@ -19,6 +19,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.heartsync.ble.BleHardReset
 import kotlinx.coroutines.launch
 import com.example.heartsync.ble.PpgBleClient
 import com.example.heartsync.data.model.BleDevice
@@ -171,6 +172,8 @@ fun BleConnectScreen(
                             val intent = Intent(ctx, MeasureService::class.java)
                                 .setAction(MeasureService.ACTION_RESET_ALL)
                             ctx.startService(intent)
+
+                            BleHardReset.run(ctx)
 
                             snackbar.showSnackbar("블루투스 연결을 초기화했어요.")
                         }
