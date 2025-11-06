@@ -1,542 +1,423 @@
-// app/src/main/java/com/example/heartsync/ble/DualRingBleClient.kt
 package com.example.heartsync.ble
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.*
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.StateFlow
-import java.util.ArrayDeque
+import kotlinx.coroutines.flow.*
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.coroutines.cancellation.CancellationException
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.min
 
-/** 그래프용: 모노토닉 타임스탬프(sec) + 원시 PPG */
-data class RawSample(val tMonoS: Double, val ppg: Float)
+/* ─────────────────────────────  모델  ───────────────────────────── */
 
-/** 내부 연결 상태 로그용 */
+data class PpgSample(val tMonoS: Double, val raw: Int, val filt: Float)
+
 sealed interface ConnState {
-    data class Connected(val name: String?, val addr: String): ConnState
-    data class Reconnecting(
-        val attempt: Int,
-        val reason: String?,
-        val name: String?,          // 재연결 대상 이름
-        val addr: String?           // 재연결 대상 주소
-    ): ConnState
-    data class Connecting(val addr: String): ConnState
-    data class Discovering(val addr: String): ConnState
-    data class Subscribing(val addr: String): ConnState
-    data class Ready(val name: String?, val addr: String): ConnState   // ✅ 새로 추가 (진짜 “연결됨”)
-    data class Disconnected(val reason: String? = null): ConnState
+    val name: String?
+    val addr: String
+    data class Connecting(override val name: String?, override val addr: String): ConnState
+    data class Connected(override val name: String?, override val addr: String): ConnState
+    data class Ready(override val name: String?, override val addr: String): ConnState
+    data class Reconnecting(override val name: String?, override val addr: String, val attempt: Int): ConnState
+    data class Disconnected(override val name: String?, override val addr: String, val reason: Int?): ConnState
 }
+
+/* ───────────────────────  UUID (R02 + Nordic NUS) ─────────────────────── */
+
+private val UUID_SVC  = UUID.fromString("6E40FFF0-B5A3-F393-E0A9-E50E24DCCA9E")
+private val UUID_RX   = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E") // write
+private val UUID_TX   = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E") // notify
+private val UUID_CCCD = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
+
+private val UUID_MAIN_SVC   = UUID.fromString("de5bf728-d711-4e47-af26-65e3012a5dc7")
+private val UUID_MAIN_RX    = UUID.fromString("de5bf72a-d711-4e47-af26-65e3012a5dc7")
+private val UUID_MAIN_TX    = UUID.fromString("de5bf729-d711-4e47-af26-65e3012a5dc7")
+
+/* ─────────────────────────  유틸/필터  ───────────────────────── */
+
+private fun Context.hasPerm(p: String) =
+    checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
+
+private inline fun <T> withBtConnect(ctx: Context, crossinline block: () -> T?): T? = try {
+    if (Build.VERSION.SDK_INT >= 31 && !ctx.hasPerm(Manifest.permission.BLUETOOTH_CONNECT)) {
+        Log.w("BT","BLUETOOTH_CONNECT not granted"); null
+    } else block()
+} catch (se: SecurityException) { Log.w("BT","SecurityException: ${se.message}"); null }
+
+private class Ema(private val a: Double) {
+    private var y = 0.0; private var inited = false
+    fun step(x: Double): Double {
+        y = if (!inited) { inited = true; x } else { a * x + (1 - a) * y }
+        return y
+    }
+}
+private class PpgBP50 {
+    private val slow = Ema(2.0/(50.0*1.0+1.0))
+    private val fast = Ema(2.0/(50.0*(1.0/8.0)+1.0))
+    fun step(x: Double): Double { val tr=slow.step(x); return fast.step(x-tr) }
+}
+
+private fun createCmd(hex: String): ByteArray {
+    val b = mutableListOf<Int>(); var i=0
+    while(i<hex.length){ b += hex.substring(i, min(i+2,hex.length)).toInt(16); i+=2 }
+    while(b.size<15) b+=0; b += (b.sum() and 0xFF)
+    return b.map{it.toByte()}.toByteArray()
+}
+private val CMD_BATTERY = createCmd("03")
+private val CMD_SET_UNITS_METRIC = createCmd("0a0200")
+private val CMD_ENABLE_RAW = createCmd("a104")
+private val CMD_DISABLE_RAW = createCmd("a102")
+
+private fun split16(data: ByteArray): List<ByteArray> {
+    if (data.size==16) return listOf(data)
+    val out=mutableListOf<ByteArray>(); var o=0
+    while(o+16<=data.size){ out+=data.copyOfRange(o,o+16); o+=16 }
+    return out
+}
+private fun parsePpg(frame: ByteArray): Int? {
+    if (frame.size!=16) return null
+    if ((frame[0].toInt() and 0xFF)!=0xA1) return null
+    if ((frame[1].toInt() and 0xFF)!=0x02) return null
+    val b=frame; return ((b[2].toInt() and 0xFF) shl 8) or (b[3].toInt() and 0xFF)
+}
+
+/* ─────────────────────  헬퍼: 권한/로그  ───────────────────── */
+
+private fun propStr(p: Int) = buildList {
+    if (p and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) add("WRITE")
+    if (p and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) add("WRITE_NR")
+    if (p and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) add("NOTIFY")
+    if (p and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) add("INDICATE")
+}.joinToString("|")
+
+private fun canWrite(ch: BluetoothGattCharacteristic?): Boolean {
+    ch ?: return false
+    val p = ch.properties
+    return (p and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0 ||
+            (p and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
+}
+
+/* ─────────────────────  GATT 클라이언트 (한쪽 링)  ───────────────────── */
+
+@SuppressLint("MissingPermission")
+class R02GattClient(
+    private val ctx: Context,
+    private val device: BluetoothDevice,
+    private val scope: CoroutineScope,
+    private val tag: String,
+    private val autoReconnect: Boolean = true,
+    private val maxAttempts: Int = 5
+){
+    private var gatt: BluetoothGatt? = null
+    private val bp = PpgBP50()
+    private var attempt = 0
+    private var readyOnce = false
+
+    private var writeChNus:  BluetoothGattCharacteristic? = null
+    private var writeChMain: BluetoothGattCharacteristic? = null
+
+    private val _conn = MutableStateFlow<ConnState>(
+        ConnState.Disconnected(device.name, device.address, null)
+    )
+    val conn: StateFlow<ConnState> = _conn
+
+    private val _ppg = MutableSharedFlow<PpgSample>(
+        replay=0, extraBufferCapacity=4096, onBufferOverflow=BufferOverflow.DROP_OLDEST
+    )
+    val ppg: SharedFlow<PpgSample> = _ppg
+
+    fun connect() {
+        _conn.value = ConnState.Connecting(device.name, device.address)
+        val transport = if (Build.VERSION.SDK_INT>=23) BluetoothDevice.TRANSPORT_LE else 0
+        withBtConnect(ctx){ gatt = device.connectGatt(ctx,false,gattCb,transport); gatt }
+    }
+
+    fun disconnect() {
+        attempt = 0; readyOnce=false
+        withBtConnect(ctx){ gatt?.disconnect(); true }
+        withBtConnect(ctx){ gatt?.close(); true }
+        gatt = null
+        _conn.value = ConnState.Disconnected(device.name, device.address, null)
+    }
+
+    /** CCCD enable (notify→indic fallback) */
+    @Suppress("DEPRECATION")
+    private fun enableNotify(g: BluetoothGatt, ch: BluetoothGattCharacteristic): Boolean {
+        try {
+            if (!g.setCharacteristicNotification(ch, true)) {
+                Log.w("R02-$tag", "setCharacteristicNotification=false for ${ch.uuid}")
+                return false
+            }
+        } catch (se: SecurityException) {
+            Log.w("R02-$tag", "setCharacteristicNotification SecurityException: ${se.message}")
+            return false
+        }
+        val cccd = try { ch.getDescriptor(UUID_CCCD) } catch (se: SecurityException) {
+            Log.w("R02-$tag","getDescriptor SecurityException: ${se.message}"); null
+        } ?: run { Log.w("R02-$tag","CCCD not found for ${ch.uuid}"); return false }
+
+        fun writeCccd(value: ByteArray): Boolean = try {
+            if (Build.VERSION.SDK_INT>=33) {
+                g.writeDescriptor(cccd, value) == android.bluetooth.BluetoothStatusCodes.SUCCESS
+            } else {
+                cccd.value = value; g.writeDescriptor(cccd)
+            }
+        } catch (_: SecurityException) { false }
+
+        if (writeCccd(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) return true
+        val indic = writeCccd(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
+        if (!indic) Log.w("R02-$tag","CCCD write failed for ${ch.uuid} (notif/indic 모두 실패)")
+        return indic
+    }
+
+    private fun resolveWriteChars(g: BluetoothGatt) {
+        writeChNus  = withBtConnect(ctx){ g.getService(UUID_SVC)?.getCharacteristic(UUID_RX) }
+        writeChMain = withBtConnect(ctx){ g.getService(UUID_MAIN_SVC)?.getCharacteristic(UUID_MAIN_RX) }
+    }
+
+    /** write: noRsp→response fallback */
+    @Suppress("DEPRECATION")
+    private fun writeNoRsp(data: ByteArray) {
+        val g = gatt ?: return
+        if (writeChNus==null && writeChMain==null) resolveWriteChars(g)
+
+        fun tryWrite(ch: BluetoothGattCharacteristic?, preferNoRsp: Boolean): Boolean {
+            ch ?: return false
+            val props = ch.properties
+            val supportNoRsp = (props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+            val supportWrite = (props and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
+
+            val candidates = buildList {
+                if (preferNoRsp && supportNoRsp) add(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                if (supportWrite) add(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                if (!preferNoRsp && supportNoRsp) add(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+            }
+
+            for (t in candidates) {
+                val ok = try {
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        g.writeCharacteristic(ch, data, t) ==
+                                android.bluetooth.BluetoothStatusCodes.SUCCESS
+                    } else {
+                        ch.writeType = t; ch.value = data; g.writeCharacteristic(ch)
+                    }
+                } catch (se: SecurityException) {
+                    Log.w("R02-$tag","write SecurityException ${se.message}")
+                    false
+                }
+                if (ok) return true
+            }
+            Log.w("R02-$tag","write fail ch=${ch.uuid} props=${propStr(props)}")
+            return false
+        }
+
+        val ok = tryWrite(writeChNus,  true) || tryWrite(writeChMain, true)
+        if (!ok) Log.w("R02-$tag","writeNoRsp failed on both RX chars")
+    }
+
+    private fun sendInit() {
+        scope.launch {
+            writeNoRsp(CMD_BATTERY);          delay(80)
+            writeNoRsp(CMD_SET_UNITS_METRIC); delay(80)
+            writeNoRsp(CMD_ENABLE_RAW)
+        }
+    }
+
+    private fun kickRawUntilReady() {
+        scope.launch {
+            var tries = 0
+            while (!readyOnce && tries < 8) {
+                writeNoRsp(CMD_BATTERY); delay(80)
+                writeNoRsp(CMD_SET_UNITS_METRIC); delay(80)
+                writeNoRsp(CMD_ENABLE_RAW)
+                tries++; delay(700)
+            }
+        }
+    }
+
+    private fun scheduleReconnect() {
+        if (!autoReconnect || attempt>=maxAttempts) return
+        attempt += 1
+        _conn.value = ConnState.Reconnecting(device.name, device.address, attempt)
+        scope.launch {
+            delay(600L*attempt)
+            connect()
+        }
+    }
+
+    /* ──────────────── 콜백 ──────────────── */
+    private val gattCb = object: BluetoothGattCallback(){
+        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            if (newState==BluetoothProfile.STATE_CONNECTED){
+                _conn.value = ConnState.Connected(g.device.name, g.device.address)
+                withBtConnect(ctx){ g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH); true }
+                if (Build.VERSION.SDK_INT>=26){
+                    withBtConnect(ctx){
+                        g.setPreferredPhy(BluetoothDevice.PHY_LE_2M, BluetoothDevice.PHY_LE_2M, BluetoothDevice.PHY_OPTION_NO_PREFERRED); true
+                    }
+                }
+                withBtConnect(ctx){ g.requestMtu(247); true }
+                withBtConnect(ctx){ g.discoverServices(); true }
+            } else if (newState==BluetoothProfile.STATE_DISCONNECTED){
+                readyOnce=false
+                _conn.value = ConnState.Disconnected(g.device.name, g.device.address, status)
+                scheduleReconnect()
+            }
+        }
+
+        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w("R02-$tag","servicesDiscovered status=$status → rediscover")
+                withBtConnect(ctx){ g.discoverServices(); true }
+                return
+            }
+            resolveWriteChars(g)
+            val nusTx  = withBtConnect(ctx){ g.getService(UUID_SVC)?.getCharacteristic(UUID_TX) }
+            val mainTx = withBtConnect(ctx){ g.getService(UUID_MAIN_SVC)?.getCharacteristic(UUID_MAIN_TX) }
+            val nusRx  = writeChNus
+            val mainRx = writeChMain
+
+            nusTx?.let  { Log.i("R02-$tag","NUS TX props=${propStr(it.properties)}") }
+            mainTx?.let { Log.i("R02-$tag","MAIN TX props=${propStr(it.properties)}") }
+            nusRx?.let  { Log.i("R02-$tag","NUS RX props=${propStr(it.properties)}") }
+            mainRx?.let { Log.i("R02-$tag","MAIN RX props=${propStr(it.properties)}") }
+
+            val nusOk  = nusTx?.let  { enableNotify(g, it) }  ?: false
+            val mainOk = mainTx?.let { enableNotify(g, it) } ?: false
+            Log.i("R02-$tag", "notify enabled: NUS=$nusOk, MAIN=$mainOk")
+
+            val writeOk = canWrite(nusRx) || canWrite(mainRx)
+            if ((nusOk || mainOk) && writeOk) {
+                scope.launch { delay(150); sendInit(); kickRawUntilReady() }
+            } else {
+                Log.w("R02-$tag","gate not open → notify=${nusOk||mainOk}, writeOk=$writeOk (재시도)")
+                scope.launch {
+                    delay(350)
+                    withBtConnect(ctx){ g.discoverServices(); true }
+                }
+            }
+        }
+
+        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, s: Int) {
+            scope.launch { delay(120); sendInit(); kickRawUntilReady() }
+        }
+
+        override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+            val isNus  = ch.uuid == UUID_TX
+            val isMain = ch.uuid == UUID_MAIN_TX
+            if (!isNus && !isMain) return
+            val frames = split16(ch.value ?: return)
+            for (f in frames) {
+                val raw = parsePpg(f) ?: continue
+                val t = SystemClock.elapsedRealtimeNanos() / 1e9
+                val filt = bp.step(raw.toDouble()).toFloat()
+                _ppg.tryEmit(PpgSample(t, raw, filt))
+                if (!readyOnce) {
+                    readyOnce = true; attempt = 0
+                    _conn.value = ConnState.Ready(g.device.name, g.device.address)
+                }
+            }
+        }
+    }
+}
+
+/* ─────────────────────  듀얼 관리 (좌/우)  ───────────────────── */
 
 class DualRingBleClient(
     private val ctx: Context,
     private val scope: CoroutineScope,
     private val leftMac: String? = null,
     private val rightMac: String? = null,
-    private val leftNamePrefix: String? = "R02_",
-    private val rightNamePrefix: String? = "R02_",
-    private val stallTimeoutSec: Double = 5.0,
+    private val leftNamePrefix: String? = null,
+    private val rightNamePrefix: String? = null,
+    private val stallTimeoutSec: Double = 5.0
 ) {
-    companion object {
-        private const val TAG = "DualRingBle"
-        private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-    }
+    private var leftClient: R02GattClient? = null
+    private var rightClient: R02GattClient? = null
 
-    private val leftFlowMutable  = MutableSharedFlow<RawSample>(
-        replay = 0, extraBufferCapacity = 1024, onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
-    private val rightFlowMutable = MutableSharedFlow<RawSample>(
-        replay = 0, extraBufferCapacity = 1024, onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
-    val leftFlow:  SharedFlow<RawSample> = leftFlowMutable
-    val rightFlow: SharedFlow<RawSample> = rightFlowMutable
+    private val _stateL = MutableStateFlow<ConnState?>(null)
+    private val _stateR = MutableStateFlow<ConnState?>(null)
 
-    private val stateFlowMutable = MutableStateFlow<Map<String, ConnState>>(emptyMap())
-    val connStates: StateFlow<Map<String, ConnState>> = stateFlowMutable
+    val connStates: StateFlow<Map<String, ConnState>> =
+        combine(_stateL, _stateR) { l, r ->
+            buildMap {
+                l?.let { put("left", it) }
+                r?.let { put("right", it) }
+            }
+        }.stateIn(scope, SharingStarted.Eagerly, emptyMap())
 
-    private var job: Job? = null
+    private val _ppgL = MutableSharedFlow<PpgSample>(extraBufferCapacity=4096, onBufferOverflow=BufferOverflow.DROP_OLDEST)
+    private val _ppgR = MutableSharedFlow<PpgSample>(extraBufferCapacity=4096, onBufferOverflow=BufferOverflow.DROP_OLDEST)
+    val ppgL: SharedFlow<PpgSample> = _ppgL
+    val ppgR: SharedFlow<PpgSample> = _ppgR
 
-    /** 현재 연결된 GATT 인스턴스(손별) — 안전 분리를 위해 보관 */
-    private val liveGatt = ConcurrentHashMap<String, BluetoothGatt?>() // key: "left"/"right"
+    @Volatile private var connecting = false
+    @Volatile private var lastLeft: String? = null
+    @Volatile private var lastRight: String? = null
 
-    /** === 신규 헬퍼: 반대 손 / 현재 주소 조회 === */
-    private fun otherHand(hand: String) = if (hand == "left") "right" else "left"
-    private fun currentAddrOf(hand: String): String? = liveGatt[hand]?.device?.address
-
-    fun start(durationSec: Int? = null) {
-        // === 1차 가드: 좌/우 MAC이 동일하게 지정된 경우 즉시 중단
-        if (!leftMac.isNullOrBlank() && !rightMac.isNullOrBlank() &&
-            leftMac.equals(rightMac, ignoreCase = true)
-        ) {
-            Log.e(TAG, "❌ 동일 MAC이 좌/우에 지정됨: $leftMac — 시작을 취소합니다.")
-            setState("left",  ConnState.Disconnected("duplicate_mac"))
-            setState("right", ConnState.Disconnected("duplicate_mac"))
+    fun start() {
+        val lAddr = leftMac; val rAddr = rightMac
+        if (lAddr==null || rAddr==null) {
+            Log.w("DualRing","start() called without both MACs")
             return
         }
-
-        stop()
-        job = scope.launch(Dispatchers.IO) {
-            supervisorScope {
-                val jL = launch { loopOne(hand = "left",  mac = leftMac,  namePrefix = leftNamePrefix,  out = leftFlowMutable) }
-                val jR = launch { loopOne(hand = "right", mac = rightMac, namePrefix = rightNamePrefix, out = rightFlowMutable) }
-                if (durationSec != null) {
-                    delay(durationSec * 1000L)
-                    jL.cancel(); jR.cancel()
-                }
-            }
+        val adapter = BluetoothAdapter.getDefaultAdapter()
+        val lDev = try { adapter.getRemoteDevice(lAddr) } catch (_:Throwable){ null }
+        val rDev = try { adapter.getRemoteDevice(rAddr) } catch (_:Throwable){ null }
+        if (lDev==null || rDev==null) {
+            Log.w("DualRing","Invalid MAC(s): L=$lAddr R=$rAddr"); return
         }
+        connectBoth(lDev, rDev)
     }
 
-    fun stop() {
-        job?.cancel()
-        job = null
-        scope.launch { resetAll() } // 코루틴만 끊으면 잔여 notify가 남을 수 있어 즉시 안전 분리 시도
+    fun stop() { disconnect() }
+
+    fun startWith(left: String, right: String) {
+        val adapter = BluetoothAdapter.getDefaultAdapter()
+        val lDev = try { adapter.getRemoteDevice(left) } catch (_:Throwable){ null }
+        val rDev = try { adapter.getRemoteDevice(right) } catch (_:Throwable){ null }
+        if (lDev==null || rDev==null) {
+            Log.w("DualRing","startWith invalid MACs"); return
+        }
+        connectBoth(lDev, rDev)
     }
 
-//    @SuppressLint("MissingPermission")
-//    suspend fun connectAndSubscribe(
-//        context: Context,
-//        device: BluetoothDevice,
-//        serviceUuid: UUID,
-//        charUuid: UUID,
-//        onSample: (Float) -> Unit,
-//        onState: (ConnState) -> Unit
-//    ) {
-//        val notifyReady = CompletableDeferred<Unit>()
-//        val firstPacket = CompletableDeferred<Unit>()
-//        var gatt: BluetoothGatt? = null
-//        var lastNotifyMs = 0L
-//
-//        withTimeout(15_000) {
-//            onState(ConnState.Connecting(device.address))
-//            gatt = device.connectGatt(context, false, object : BluetoothGattCallback() {
-//
-//                override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
-//                    if (status != BluetoothGatt.GATT_SUCCESS || newState != BluetoothProfile.STATE_CONNECTED) {
-//                        onState(ConnState.Disconnected("conn status=$status state=$newState"))
-//                        if (!notifyReady.isCompleted) notifyReady.completeExceptionally(RuntimeException("conn fail"))
-//                        return
-//                    }
-//                    g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-//                    g.requestMtu(247)
-//                    g.discoverServices()
-//                    onState(ConnState.Discovering(device.address))
-//                }
-//
-//                override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-//                    if (status != BluetoothGatt.GATT_SUCCESS) {
-//                        onState(ConnState.Disconnected("discover=$status"))
-//                        if (!notifyReady.isCompleted) notifyReady.completeExceptionally(RuntimeException("discover fail"))
-//                        return
-//                    }
-//                    val svc = g.getService(serviceUuid) ?: return
-//                    val chr = svc.getCharacteristic(charUuid) ?: return
-//
-//                    onState(ConnState.Subscribing(device.address))
-//                    g.setCharacteristicNotification(chr, true)
-//                    val cccd = chr.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-//                    cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-//                    g.writeDescriptor(cccd)
-//                }
-//
-//                override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-//                    if (status == BluetoothGatt.GATT_SUCCESS) {
-//                        if (!notifyReady.isCompleted) notifyReady.complete(Unit)
-//                    }
-//                }
-//
-//                override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-//                    if (characteristic.uuid == charUuid) {
-//                        val bytes = characteristic.value ?: return
-//                        val ppg = parsePpg(bytes) // ✅ 여기서 수신 데이터 파싱 함수 연결
-//                        lastNotifyMs = System.currentTimeMillis()
-//                        onSample(ppg)
-//                        if (!firstPacket.isCompleted) firstPacket.complete(Unit)
-//                    }
-//                }
-//            })
-//        }
-//
-//        withTimeout(5_000) { notifyReady.await() }
-//        withTimeout(5_000) { firstPacket.await() }
-//
-//        onState(ConnState.Ready(gatt?.device?.name, gatt?.device?.address ?: ""))
-//
-//        GlobalScope.launch(Dispatchers.IO) {
-//            while (true) {
-//                delay(1_000)
-//                val gap = System.currentTimeMillis() - lastNotifyMs
-//                if (gap > 3_500) {
-//                    onState(ConnState.Reconnecting(gatt?.device?.address ?: ""))
-//                    try { gatt?.disconnect() } catch (_: Throwable) {}
-//                    try { gatt?.close() } catch (_: Throwable) {}
-//                    break
-//                }
-//            }
-//        }
-//    }
+    suspend fun resetAll() { disconnect() }
 
-
-    /** 외부 공개: 두 센서 모두 안전 분리 (CCCD off → DISABLE → disconnect/close) */
-    @SuppressLint("MissingPermission")
-    suspend fun resetAll() = withContext(Dispatchers.IO) {
-        // ★★★ 동시성 안전을 위해 스냅샷을 순회
-        val snapshot = liveGatt.toMap()
-        for ((hand, g) in snapshot) {
-            if (g != null) {
-                runCatching { writeDisable(g) }
-                runCatching { disableAllCccd(g) }
-                runCatching { g.disconnect() }
-                runCatching { g.close() }
-            }
-            // ★★★ null put 대신 remove
-            liveGatt.remove(hand)
-            setState(hand, ConnState.Disconnected("user_reset"))
+    private fun connectBoth(left: BluetoothDevice, right: BluetoothDevice) {
+        val curL = left.address; val curR = right.address
+        if (connecting && curL==lastLeft && curR==lastRight) {
+            Log.w("DualRing","connectBoth ignored (duplicate call)")
+            return
         }
+        connecting = true; lastLeft = curL; lastRight = curR
+
+        disconnect()
+        leftClient = R02GattClient(ctx, left, scope, "L").also { c ->
+            scope.launch { c.conn.collect { _stateL.value = it } }
+            scope.launch { c.ppg.collect { _ppgL.tryEmit(it) } }
+            c.connect()
+        }
+        rightClient = R02GattClient(ctx, right, scope, "R").also { c ->
+            scope.launch { c.conn.collect { _stateR.value = it } }
+            scope.launch { c.ppg.collect { _ppgR.tryEmit(it) } }
+            c.connect()
+        }
+
+        scope.launch { delay(3000); connecting = false }
     }
 
-    // ---- 단일 손 루프(자동 재연결 + 스톨 감지) ----
-    @SuppressLint("MissingPermission")
-    private suspend fun loopOne(
-        hand: String,
-        mac: String?,
-        namePrefix: String?,
-        out: MutableSharedFlow<RawSample>
-    ) {
-        var attempt = 0
-        val cc = currentCoroutineContext()
-        while (cc.isActive) {
-            attempt += 1
-            var gatt: BluetoothGatt? = null
-            var lastPpgMono = 0.0
-            try {
-                // 1) 장치 찾기 — 반대쪽에 이미 연결/지정된 주소는 제외
-                val exclude = currentAddrOf(otherHand(hand))
-                    ?: if (hand == "left") rightMac else leftMac
-
-                val device = resolveDevice(mac, namePrefix, excludeAddr = exclude)
-                if (device == null) {
-                    setState(hand, ConnState.Reconnecting(attempt, "not found", null, null))
-                    delay(1000); continue
-                }
-
-                // 2) 콜백
-                val cb = object: BluetoothGattCallback() {
-
-                    // --- 내부 상태(이 GATT 인스턴스 한정) ---
-                    private val cccdQueue: ArrayDeque<BluetoothGattDescriptor> = ArrayDeque()
-                    private val enableSent = AtomicBoolean(false)
-
-                    override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
-                        Log.d(TAG, "[$hand] onConnectionStateChange status=$status newState=$newState")
-                        if (newState == BluetoothProfile.STATE_CONNECTED) {
-                            setState(hand, ConnState.Connected(device.name, device.address))
-
-                            // === 연결 직후 2차 가드: 반대쪽과 동일 MAC이면 즉시 분리
-                            val otherAddr = currentAddrOf(otherHand(hand))
-                            if (otherAddr != null && otherAddr.equals(device.address, ignoreCase = true)) {
-                                Log.w(TAG, "[$hand] 동일 MAC이 다른 손에 이미 연결됨 → 즉시 분리")
-                                setState(hand, ConnState.Reconnecting(attempt, "duplicate_mac", device.name, device.address))
-                                runCatching { g.disconnect() }
-                                return
-                            }
-
-                            g.discoverServices()
-                        } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                            setState(hand, ConnState.Reconnecting(attempt, "disconnected: $status", device.name, device.address))
-                            runCatching { g.close() }
-                        }
-                    }
-
-                    override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-                        Log.d(TAG, "[$hand] services discovered status=$status")
-                        if (status == BluetoothGatt.GATT_SUCCESS) {
-                            val ok = g.requestMtu(247)
-                            Log.d(TAG, "[$hand] requestMtu(247) ok=$ok")
-                        } else {
-                            setState(hand, ConnState.Reconnecting(attempt, "svc discover failed $status", device.name, device.address))
-                            runCatching { g.disconnect() }
-                        }
-                    }
-
-                    override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-                        Log.d(TAG, "[$hand] onMtuChanged mtu=$mtu status=$status")
-                        g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                        enableNeededCccds(g)
-                    }
-
-                    override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-                        writeNextCccd(g)
-                    }
-
-                    override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-                        val t = SystemClock.elapsedRealtimeNanos() / 1e9
-                        val data = ch.value ?: return
-                        // Telink 스트림 해석 (PPG만 추출) — R02Proto는 프로젝트에 이미 존재한다고 가정
-                        try {
-                            val frames = R02Proto.decodeTelinkStream(data)
-                            for (f in frames) {
-                                val p = f.ppg ?: continue
-                                lastPpgMono = t
-                                out.tryEmit(RawSample(t, p.toFloat()))
-
-                                // ⬇️ 첫 패킷 들어오면 Ready로 승격 (핵심)
-                                if (stateFlowMutable.value[hand] !is ConnState.Ready) {
-                                    setState(hand, ConnState.Ready(device.name, device.address))
-                                }
-                            }
-                        } catch (_: Throwable) { /* ignore */ }
-                    }
-
-                    // ===== 내부 도우미 =====
-
-                    private fun enableNeededCccds(g: BluetoothGatt) {
-                        cccdQueue.clear()
-                        val targets = setOf(R02Proto.RXTX_NOTIFY, R02Proto.MAIN_NOTIFY)
-                        val svcs = g.services ?: return
-                        for (svc in svcs) {
-                            for (ch in svc.characteristics ?: emptyList()) {
-                                if (ch.uuid !in targets) continue
-                                val p = ch.properties
-                                val canNotify = (p and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
-                                val canIndicate = (p and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
-                                if (!canNotify && !canIndicate) continue
-
-                                val okSet = g.setCharacteristicNotification(ch, true)
-                                val cccd = ch.getDescriptor(CCCD_UUID)
-                                if (cccd != null) {
-                                    cccd.value = if (canNotify)
-                                        BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                                    else
-                                        BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                                    cccdQueue.addLast(cccd)
-                                    Log.d(TAG, "[$hand] queue CCCD for ${ch.uuid} (okSet=$okSet)")
-                                } else {
-                                    Log.d(TAG, "[$hand] ${ch.uuid} has no CCCD")
-                                }
-                            }
-                        }
-                        writeNextCccd(g)
-                    }
-
-                    private fun writeNextCccd(g: BluetoothGatt) {
-                        val next: BluetoothGattDescriptor? =
-                            if (cccdQueue.isEmpty()) null else cccdQueue.removeFirst()
-                        if (next == null) {
-                            if (enableSent.compareAndSet(false, true)) {
-                                scope.launch {
-                                    delay(200); writeEnable(g)
-                                    delay(150); writeEnable(g) // 일부 기기 첫 패킷 드롭 방지
-                                }
-                            }
-                            return
-                        }
-                        // ⬇️ 1.5초 내 무패킷이면 ENABLE 재시도
-                        scope.launch {
-                            delay(1500)
-                            if (lastPpgMono == 0.0) {    // 아직 첫 패킷 없음
-                                writeEnable(g)
-                            }
-                        }
-                        val ok = g.writeDescriptor(next)
-                        if (!ok) {
-                            // 실패 시 다음으로 넘어감(막힘 방지)
-                            writeNextCccd(g)
-                        }
-
-                    }
-                }
-
-                // 3) 연결 시작
-                gatt = if (Build.VERSION.SDK_INT >= 31) {
-                    device.connectGatt(ctx, false, cb, BluetoothDevice.TRANSPORT_LE)
-                } else {
-                    device.connectGatt(ctx, false, cb)
-                }
-                // ★★★ 추가: null 가드
-                if (gatt == null) {
-                    setState(
-                        hand,
-                        ConnState.Reconnecting(
-                            attempt = attempt,
-                            reason = "connectGatt returned null",
-                            name = device.name,
-                            addr = device.address
-                        )
-                    )
-                    delay(800)
-                    continue
-                }
-
-                // ★★★ gatt가 null이 아닐 때만 보관
-                liveGatt[hand] = gatt
-
-                // 4) 스톨 감시
-                val pollPeriodMs = 500L
-                while (currentCoroutineContext().isActive) {
-                    delay(pollPeriodMs)
-                    val nowS = SystemClock.elapsedRealtimeNanos() / 1e9
-                    if (lastPpgMono == 0.0) continue
-                    if (nowS - lastPpgMono > stallTimeoutSec) {
-                        setState(
-                            hand,
-                            ConnState.Reconnecting(
-                                attempt = attempt,
-                                reason = "stall ${"%.1f".format(nowS - lastPpgMono)}s",
-                                name = device.name,
-                                addr = device.address
-                            )
-                        )
-                        throw RuntimeException("stall")
-                    }
-                }
-            } catch (e: CancellationException) {
-                break
-            } catch (e: Throwable) {
-                Log.w(TAG, "[$hand] loop error: ${e.message}")
-                setState(
-                    hand,
-                    ConnState.Reconnecting(
-                        attempt = attempt,
-                        reason = e.message,
-                        name = null,
-                        addr = null
-                    )
-                )
-                delay(1000L * attempt.coerceAtMost(5))
-            } finally {
-                runCatching { gatt?.disconnect(); gatt?.close() }
-                // ★★★ ConcurrentHashMap은 null value 불가 → remove 사용
-                liveGatt.remove(hand)
-            }
-        }
-    }
-
-    private fun setState(hand: String, st: ConnState) {
-        val cur = stateFlowMutable.value.toMutableMap()
-        cur[hand] = st
-        stateFlowMutable.value = cur
-    }
-
-    // ---- 명령 전송 (ENABLE/DISABLE) ----
-    @SuppressLint("MissingPermission")
-    private fun writeEnable(g: BluetoothGatt) =
-        writeCmd(g, R02Proto.RXTX_WRITE, R02Proto.ENABLE)
-
-    @SuppressLint("MissingPermission")
-    private fun writeDisable(g: BluetoothGatt) =
-        writeCmd(g, R02Proto.RXTX_WRITE, R02Proto.DISABLE)
-
-    @SuppressLint("MissingPermission")
-    private fun writeCmd(g: BluetoothGatt, chUuid: UUID, payload: ByteArray) {
-        var target: BluetoothGattCharacteristic? = null
-        val svcs = g.services ?: emptyList()
-        outer@ for (svc in svcs) {
-            val chars = svc.characteristics ?: continue
-            for (ch in chars) {
-                if (ch.uuid == chUuid) { target = ch; break@outer }
-            }
-        }
-        val ch = target ?: run { Log.w(TAG, "writeCmd: characteristic $chUuid not found"); return }
-
-        if (Build.VERSION.SDK_INT >= 33) {
-            val res = g.writeCharacteristic(
-                ch, payload,
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            )
-            Log.d(TAG, "writeCmd API33+ NO_RESPONSE $chUuid res=$res")
-        } else {
-            ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            ch.value = payload
-            val res = g.writeCharacteristic(ch)
-            Log.d(TAG, "writeCmd legacy NO_RESPONSE $chUuid res=$res")
-        }
-    }
-
-    // ---- 장치 탐색 (반대쪽 주소 제외 지원) ----
-    @SuppressLint("MissingPermission")
-    private suspend fun resolveDevice(
-        mac: String?,
-        namePrefix: String?,
-        excludeAddr: String?
-    ): BluetoothDevice? {
-        val adapter = (ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
-        if (adapter == null || !adapter.isEnabled) return null
-
-        // 1) MAC 이 있으면 바로 사용 (단, 제외 주소와 같으면 null)
-        if (!mac.isNullOrBlank()) {
-            if (!excludeAddr.isNullOrBlank() && mac.equals(excludeAddr, ignoreCase = true)) {
-                Log.w(TAG, "resolveDevice: excluded mac=$mac")
-                return null
-            }
-            return runCatching { adapter.getRemoteDevice(mac) }.getOrNull()
-        }
-
-        // 2) 스캔으로 이름 프리픽스 매칭 (제외 주소는 건너뜀)
-        val scanner = adapter.bluetoothLeScanner ?: return null
-        val res = CompletableDeferred<BluetoothDevice?>()
-        val cb = object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val dev = result.device ?: return
-                val name = dev.name ?: result.scanRecord?.deviceName ?: ""
-                val addr = dev.address
-                if (!excludeAddr.isNullOrBlank() && excludeAddr.equals(addr, ignoreCase = true)) return
-                if (namePrefix.isNullOrBlank() || name.startsWith(namePrefix)) {
-                    res.complete(dev)
-                }
-            }
-            override fun onBatchScanResults(results: MutableList<ScanResult>) {
-                for (r in results) onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, r)
-            }
-            override fun onScanFailed(errorCode: Int) { res.complete(null) }
-        }
-        scanner.startScan(
-            null,
-            ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
-            cb
-        )
-        val device = withTimeoutOrNull(8000L) { res.await() }
-        runCatching { scanner.stopScan(cb) }
-        return device
-    }
-
-    // ===== 안전 분리용 헬퍼 =====
-    @SuppressLint("MissingPermission")
-    private fun disableAllCccd(g: BluetoothGatt) {
-        val targets = setOf(R02Proto.RXTX_NOTIFY, R02Proto.MAIN_NOTIFY)
-        val svcs = g.services ?: return
-        for (svc in svcs) {
-            for (ch in svc.characteristics ?: emptyList()) {
-                if (ch.uuid !in targets) continue
-                runCatching { g.setCharacteristicNotification(ch, false) }
-                val cccd = ch.getDescriptor(CCCD_UUID) ?: continue
-                if (Build.VERSION.SDK_INT >= 33) {
-                    runCatching { g.writeDescriptor(cccd, BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE) }
-                } else {
-                    @Suppress("DEPRECATION")
-                    runCatching {
-                        cccd.value = BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-                        g.writeDescriptor(cccd)
-                    }
-                }
-            }
-        }
+    private fun disconnect() {
+        leftClient?.apply { disconnect() }
+        rightClient?.apply { disconnect() }
+        leftClient = null; rightClient = null
+        _stateL.value?.let { _stateL.value = ConnState.Disconnected(it.name, it.addr, null) }
+        _stateR.value?.let { _stateR.value = ConnState.Disconnected(it.name, it.addr, null) }
     }
 }
-
-

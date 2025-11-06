@@ -7,7 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.heartsync.ble.ConnState
 import com.example.heartsync.ble.DualRingBleClient
-import com.example.heartsync.ble.RawSample
+import com.example.heartsync.ble.PpgSample
 import com.example.heartsync.data.DevicePrefs
 import com.example.heartsync.signal.SyncResampler
 import com.example.heartsync.signal.SyncedPoint
@@ -173,8 +173,10 @@ class DualRingViewModel(app: Application) : AndroidViewModel(app) {
                 var lastLeftMono = 0.0
                 var lastRightMono = 0.0
 
-                launch { c.leftFlow.collect { s -> lCount++;  lastLeftMono  = s.tMonoS } }
-                launch { c.rightFlow.collect { s -> rCount++; lastRightMono = s.tMonoS } }
+                // ⛔ 기존: c.leftFlow / c.rightFlow
+                // ✅ 수정: c.ppgL / c.ppgR (타입도 명시)
+                launch { client!!.ppgL.collect { s: PpgSample -> lCount++;  lastLeftMono  = s.tMonoS } }
+                launch { client!!.ppgR.collect { s: PpgSample -> rCount++;  lastRightMono = s.tMonoS } }
 
                 while (isActive) {
                     delay(1000)
@@ -189,9 +191,9 @@ class DualRingViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
-            // 3) (기존) 동기 포인트 생성 — 다른 화면에서 필요할 수 있어 유지
+            // ✅ 동기 포인트 생성도 ppgL/ppgR 로
             launch {
-                resampler.fuse(c.leftFlow, c.rightFlow)
+                resampler.fuse(client!!.ppgL, client!!.ppgR)
                     .runningFold(emptyList<SyncedPoint>()) { acc, v ->
                         val cap = 10.0
                         val tmin = v.tMonoS - cap
@@ -201,10 +203,10 @@ class DualRingViewModel(app: Application) : AndroidViewModel(app) {
                     .collect { _points.value = it }
             }
 
-            // 4) 신규: 좌/우 ppgf(DC→MA) 생성 + 10s 창 유지(표시 50Hz로 다운샘플)
+            // ✅ 좌/우 실시간 ppgf 생성
             launch {
-                c.leftFlow.collect { s: RawSample ->
-                    val y = filtL.update(s.ppg.toDouble()) ?: return@collect
+                client!!.ppgL.collect { s: PpgSample ->
+                    val y = filtL.update(s.filt.toDouble()) ?: return@collect   // was s.ppg
                     if (s.tMonoS < nextEmitLeftAt) return@collect
                     nextEmitLeftAt = s.tMonoS + emitStep
                     val t0 = s.tMonoS.toFloat()
@@ -216,8 +218,8 @@ class DualRingViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             launch {
-                c.rightFlow.collect { s: RawSample ->
-                    val y = filtR.update(s.ppg.toDouble()) ?: return@collect
+                client!!.ppgR.collect { s: PpgSample ->
+                    val y = filtR.update(s.filt.toDouble()) ?: return@collect   // was s.ppg
                     if (s.tMonoS < nextEmitRightAt) return@collect
                     nextEmitRightAt = s.tMonoS + emitStep
                     val t0 = s.tMonoS.toFloat()

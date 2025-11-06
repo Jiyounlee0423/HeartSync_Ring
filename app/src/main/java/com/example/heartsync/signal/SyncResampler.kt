@@ -1,10 +1,11 @@
 package com.example.heartsync.signal
 
-import com.example.heartsync.ble.RawSample
+import com.example.heartsync.ble.PpgSample
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.*
 import kotlin.math.max
-import kotlinx.coroutines.channels.awaitClose
+import kotlin.math.min
 
 data class SyncedPoint(
     val tMonoS: Double,   // 공통 시간축(모노토닉)
@@ -13,54 +14,59 @@ data class SyncedPoint(
 )
 
 class SyncResampler(
-    private val fsMs: Int = 20,
+    private val fsMs: Int = 20,       // 20ms → 50 Hz
     private val windowS: Double = 10.0
 ) {
-    private val dtS = fsMs / 1000.0
+    private val dtS = fsMs / 1000.0   // 리샘플 간격(초)
 
     /**
-     * 두 손 raw 플로우를 받아 20ms 격자에 보간 후 (left,right) 동기 포인트를 방출.
-     * - 간단한 1차 선형 보간(interp)
-     * - 앞/뒤 경계는 최근값 유지(ffill/bfill 느낌)
+     * 두 손 PPG 플로우를 받아 20ms 격자에 선형보간 후 (left,right) 동기 포인트 방출.
+     * - 경계는 최근값 유지(ffill)
      */
-    fun fuse(leftFlow: Flow<RawSample>, rightFlow: Flow<RawSample>): Flow<SyncedPoint> = channelFlow {
-        val leftBuf  = ArrayDeque<RawSample>()
-        val rightBuf = ArrayDeque<RawSample>()
-        var lastEmitT = 0.0
+    fun fuse(leftFlow: Flow<PpgSample>, rightFlow: Flow<PpgSample>): Flow<SyncedPoint> = channelFlow {
+        val leftBuf  = ArrayDeque<PpgSample>()
+        val rightBuf = ArrayDeque<PpgSample>()
+        var lastEmitT = Double.NaN
 
         fun prune(now: Double) {
             val lim = now - windowS * 1.5
-            while (leftBuf.isNotEmpty() && leftBuf.first().tMonoS < lim)  leftBuf.removeFirst()
+            while (leftBuf.isNotEmpty()  && leftBuf.first().tMonoS  < lim) leftBuf.removeFirst()
             while (rightBuf.isNotEmpty() && rightBuf.first().tMonoS < lim) rightBuf.removeFirst()
         }
-        fun interp(buf: ArrayDeque<RawSample>, t: Double): Float? {
+
+        // filt(필터 후) 값을 보간 — 필요시 raw로 바꿔도 됨
+        fun interp(buf: ArrayDeque<PpgSample>, t: Double): Float? {
             if (buf.isEmpty()) return null
-            // 경계: t보다 작은 마지막값/큰 첫값 찾기
-            var lo = buf.first()
-            var hi = buf.last()
-            if (t <= lo.tMonoS) return lo.ppg
-            if (t >= hi.tMonoS) return hi.ppg
-            // 이분 탐색 대체: 선형 스캔(샘플링 속도 낮아도 충분)
-            var prev = lo
+            val lo0 = buf.first()
+            val hi0 = buf.last()
+            if (t <= lo0.tMonoS) return lo0.filt
+            if (t >= hi0.tMonoS) return hi0.filt
+
+            var prev = lo0
             for (s in buf) {
                 if (s.tMonoS >= t) {
-                    hi = s; lo = prev
+                    val lo = prev
+                    val hi = s
                     val w = ((t - lo.tMonoS) / (hi.tMonoS - lo.tMonoS)).coerceIn(0.0, 1.0)
-                    return ( (1.0 - w) * lo.ppg + w * hi.ppg ).toFloat()
+                    val v = ((1.0 - w) * lo.filt + w * hi.filt).toFloat()
+                    return v
                 }
                 prev = s
             }
-            return buf.last().ppg
+            return buf.last().filt
         }
 
         val s = this
+
         val jobL = launch {
             leftFlow.collect { l ->
                 leftBuf.addLast(l)
-                prune(max(l.tMonoS, if (rightBuf.isEmpty()) l.tMonoS else rightBuf.last().tMonoS))
-                // 타임라인 갱신
-                val tNow = minOf(leftBuf.last().tMonoS, rightBuf.lastOrNull()?.tMonoS ?: leftBuf.last().tMonoS)
-                if (lastEmitT == 0.0) lastEmitT = tNow
+                // 반대 버퍼 최신 t와 비교해서 오래된 데이터 정리
+                val latestOther = rightBuf.lastOrNull()?.tMonoS ?: l.tMonoS
+                prune(max(l.tMonoS, latestOther))
+
+                val tNow = min(leftBuf.last().tMonoS, rightBuf.lastOrNull()?.tMonoS ?: leftBuf.last().tMonoS)
+                if (lastEmitT.isNaN()) lastEmitT = tNow
                 while (tNow - lastEmitT >= dtS) {
                     val t = lastEmitT + dtS
                     val vl = interp(leftBuf, t)
@@ -70,12 +76,15 @@ class SyncResampler(
                 }
             }
         }
+
         val jobR = launch {
             rightFlow.collect { r ->
                 rightBuf.addLast(r)
-                prune(max(r.tMonoS, if (leftBuf.isEmpty()) r.tMonoS else leftBuf.last().tMonoS))
-                val tNow = minOf(rightBuf.last().tMonoS, leftBuf.lastOrNull()?.tMonoS ?: rightBuf.last().tMonoS)
-                if (lastEmitT == 0.0) lastEmitT = tNow
+                val latestOther = leftBuf.lastOrNull()?.tMonoS ?: r.tMonoS
+                prune(max(r.tMonoS, latestOther))
+
+                val tNow = min(rightBuf.last().tMonoS, leftBuf.lastOrNull()?.tMonoS ?: rightBuf.last().tMonoS)
+                if (lastEmitT.isNaN()) lastEmitT = tNow
                 while (tNow - lastEmitT >= dtS) {
                     val t = lastEmitT + dtS
                     val vl = interp(leftBuf, t)
@@ -85,6 +94,10 @@ class SyncResampler(
                 }
             }
         }
-        awaitClose { jobL.cancel(); jobR.cancel() }
+
+        awaitClose {
+            jobL.cancel()
+            jobR.cancel()
+        }
     }
 }

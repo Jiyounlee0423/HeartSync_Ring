@@ -44,8 +44,11 @@ import com.example.heartsync.data.remote.PpgRepository
 import com.google.firebase.FirebaseApp
 import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.launch
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.ActivityCompat
 
 class MainActivity : ComponentActivity() {
+
 
     // ★ Activity 범위에서 단 하나의 BLE ViewModel 생성(앱 전체 공유)
     private val bleVm: BleViewModel by viewModels()
@@ -55,6 +58,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // ✅ 앱 시작 시 BLE 권한 요청 (Android 12+ : SCAN/CONNECT, 이하: 위치)
+        requestRuntimePerms()
 
         lifecycleScope.launch {
             val auth = FirebaseAuth.getInstance()
@@ -102,6 +108,7 @@ class MainActivity : ComponentActivity() {
                 android.util.Log.e("Firestore", "TEST WRITE FAIL", t)
             }
         }
+
 
         setContent {
             HeartSyncTheme {
