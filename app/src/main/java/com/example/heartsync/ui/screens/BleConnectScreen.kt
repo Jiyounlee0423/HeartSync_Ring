@@ -189,21 +189,18 @@ fun BleConnectScreen(
 
                 Button(
                     onClick = {
-                        when {
-                            leftMac == null || rightMac == null ->
-                                scope.launch { snackbar.showSnackbar("왼손/오른손을 모두 지정하세요.") }
-                            leftReady && rightReady -> onDone?.invoke()
-                            else -> {
-                                val failSides = buildList {
-                                    if (!leftReady) add("왼손")
-                                    if (!rightReady) add("오른손")
-                                }.joinToString(", ")
-                                scope.launch { snackbar.showSnackbar("$failSides 준비가 아직 완료되지 않았습니다.") }
-                            }
+                        if (leftReady && rightReady) {
+                            onDone?.invoke()        // 홈 화면으로 네비게이션 (호출하는 쪽에서 nav 처리)
+                        } else {
+                            val failSides = buildList {
+                                if (!leftReady) add("왼손")
+                                if (!rightReady) add("오른손")
+                            }.joinToString(", ")
+                            scope.launch { snackbar.showSnackbar("$failSides 준비가 아직 완료되지 않았습니다.") }
                         }
                     },
                     modifier = Modifier.weight(1f).height(48.dp),
-                    enabled = leftReady && rightReady
+                    enabled = leftReady && rightReady   // 🔑 Ready 기준
                 ) { Text("완료") }
             }
         }
