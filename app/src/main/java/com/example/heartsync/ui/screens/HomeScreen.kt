@@ -33,11 +33,19 @@ import java.text.SimpleDateFormat
 import java.time.LocalDate
 import java.util.*
 import com.example.heartsync.viewmodel.RxStats
+import com.example.heartsync.ble.ConnState
 
 // === DualRing (좌/우 링 동시 수신) ===
 import com.example.heartsync.viewmodel.DualRingViewModel
 
 // --------------------------- Screen ---------------------------
+
+fun ConnState?.displayNameOnly(): String = when (this) {
+    is ConnState.Ready        -> name?.takeIf { it.isNotBlank() } ?: "—"
+    is ConnState.Connected    -> name?.takeIf { it.isNotBlank() } ?: "—"  // 여유 대비
+    is ConnState.Reconnecting -> name?.takeIf { it.isNotBlank() } ?: "—"
+    else -> "—"
+}
 
 @Composable
 fun HomeScreen(
@@ -59,7 +67,12 @@ fun HomeScreen(
     // 좌/우 연결 여부 & 이름 라벨
     val leftState  = connStates["left"]
     val rightState = connStates["right"]
-    val isConnected = bothConnected
+    val isConnected = (connStates["left"]  is ConnState.Ready) &&
+            (connStates["right"] is ConnState.Ready)
+
+    val leftName  = connStates["left"].displayNameOnly()
+    val rightName = connStates["right"].displayNameOnly()
+
 
     fun labelOf(stateAny: Any?): String {
         val s = stateAny?.toString() ?: return "—"
@@ -73,8 +86,7 @@ fun HomeScreen(
             else -> s
         }
     }
-    val leftName  = labelOf(leftState)
-    val rightName = labelOf(rightState)
+
 
     // 로그인/데이터
     val isLoggedIn by vm.isLoggedIn.collectAsStateWithLifecycle()
@@ -371,7 +383,10 @@ fun HomeGraphSection(
         return
     }
 
+    // 1) 윈도우 자르기
     val slice = if (points.size > window) points.takeLast(window) else points
+
+    // 2) Y범위 계산(좌/우 합쳐서)
     val ys = slice.flatMap { listOfNotNull(it.left, it.right) }
     val (yLo, yHi) = if (ys.isNotEmpty()) {
         val minY = ys.minOrNull()!!
@@ -381,27 +396,28 @@ fun HomeGraphSection(
             (minY - pad) to (maxY + pad)
         }
     } else 0.0 to 1.0
+    val ySpan = (yHi - yLo).let { if (it <= 1e-9) 1.0 else it } // 분모 0 방지
 
-    val leftColor = MaterialTheme.colorScheme.primary
+    // 3) 색상(Compose 밖에서 미리 뽑기)
+    val leftColor  = MaterialTheme.colorScheme.primary
     val rightColor = MaterialTheme.colorScheme.tertiary
-    val gridColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+    val gridColor  = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
 
+    // 4) 하단 라벨
     val labelCount = when {
         slice.size <= 300  -> 4
         slice.size <= 600  -> 6
         slice.size <= 1000 -> 8
         else               -> 10
     }
-    val labelIndices =
-        if (labelCount <= 1) listOf(0)
-        else (0 until labelCount).map { i -> ((slice.size - 1).toFloat() * i / (labelCount - 1)).toInt() }
+    val labelIdxs = if (labelCount <= 1) listOf(0) else
+        (0 until labelCount).map { i -> ((slice.lastIndex.toFloat() * i) / (labelCount - 1)).toInt().coerceIn(0, slice.lastIndex) }
 
     val sdf = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
-    fun labelAt(idx: Int): String {
+    val xLabels = labelIdxs.map { idx ->
         val ms = slice[idx].serverTime ?: slice[idx].time
-        return sdf.format(Date(ms))
+        sdf.format(Date(ms))
     }
-    val xLabels = labelIndices.map(::labelAt)
 
     Column(Modifier.fillMaxWidth()) {
         Box(
@@ -418,32 +434,74 @@ fun HomeGraphSection(
                 val stepX = w / (n - 1)
 
                 fun yMap(v: Double): Float {
-                    val t = ((v - yLo) / (yHi - yLo)).coerceIn(0.0, 1.0)
+                    val t = ((v - yLo) / ySpan).coerceIn(0.0, 1.0)
                     return (h - (t * h)).toFloat()
                 }
 
-                var prevL: Offset? = null
-                slice.forEachIndexed { i, p ->
-                    val v = p.left ?: return@forEachIndexed
-                    val cur = Offset(i * stepX, yMap(v))
-                    prevL?.let { drawLine(color = leftColor, start = it, end = cur, strokeWidth = 2f) }
-                    prevL = cur
+                // ==== 가벼운 간격 샘플링(너무 많을 때만 줄임) ====
+                val maxSegments = 2_000 // 필요 시 조절
+                val stride = if (n > maxSegments) (n / maxSegments).coerceAtLeast(1) else 1
+
+                // ==== Path로 한 번에 그리기 (Left) ====
+                val pathL = androidx.compose.ui.graphics.Path()
+                var firstL = true
+                var px = 0f
+                for (i in 0 until n step stride) {
+                    val v = slice[i].left ?: continue
+                    val x = i * stepX
+                    val y = yMap(v)
+                    if (firstL) {
+                        pathL.moveTo(x, y)
+                        firstL = false
+                    } else {
+                        // 복수 점을 한번에 연결
+                        pathL.lineTo(x, y)
+                    }
+                    px = x
+                }
+                // 끝 점이 샘플링에 의해 빠졌을 수 있으니 보정
+                val lastLeft = slice.last().left
+                if (lastLeft != null && px < w) {
+                    pathL.lineTo(w, yMap(lastLeft))
                 }
 
-                var prevR: Offset? = null
-                slice.forEachIndexed { i, p ->
-                    val v = p.right ?: return@forEachIndexed
-                    val cur = Offset(i * stepX, yMap(v))
-                    prevR?.let { drawLine(color = rightColor, start = it, end = cur, strokeWidth = 3.5f) }
-                    prevR = cur
+                // ==== Path (Right) ====
+                val pathR = androidx.compose.ui.graphics.Path()
+                var firstR = true
+                px = 0f
+                for (i in 0 until n step stride) {
+                    val v = slice[i].right ?: continue
+                    val x = i * stepX
+                    val y = yMap(v)
+                    if (firstR) {
+                        pathR.moveTo(x, y)
+                        firstR = false
+                    } else {
+                        pathR.lineTo(x, y)
+                    }
+                    px = x
+                }
+                val lastRight = slice.last().right
+                if (lastRight != null && px < w) {
+                    pathR.lineTo(w, yMap(lastRight))
                 }
 
+                // ==== 그리드선 ====
                 val gridLines = 4
-                val stepVal = (yHi - yLo) / gridLines
+                val stepVal = ySpan / gridLines
                 repeat(gridLines + 1) { idx ->
                     val y = yMap(yLo + stepVal * idx)
-                    drawLine(color = gridColor, start = Offset(0f, y), end = Offset(w, y), strokeWidth = 1f)
+                    drawLine(
+                        color = gridColor,
+                        start = Offset(0f, y),
+                        end = Offset(w, y),
+                        strokeWidth = 1f
+                    )
                 }
+
+                // ==== Stroke 그리기 ====
+                drawPath(path = pathL, color = leftColor, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2f))
+                drawPath(path = pathR, color = rightColor, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3.5f))
             }
         }
 
@@ -458,6 +516,7 @@ fun HomeGraphSection(
         }
     }
 }
+
 
 @Composable
 private fun LiveStatus(stats: RxStats) {
