@@ -173,6 +173,11 @@ class PpgBleClient(
         scanCallback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val dev = result.device ?: return
+
+                // ⬇️ 추가: 이름이 R02_ 로 시작하는 기기만 목록에 포함
+                val name = dev.name ?: ""
+                if (!name.startsWith("R02_")) return
+
                 val item = BleDevice(dev.name, dev.address)
                 val cur = _scanResults.value
                 if (cur.none { it.address == item.address }) {

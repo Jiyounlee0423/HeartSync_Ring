@@ -36,7 +36,11 @@ sealed interface ConnState {
         val name: String?,          // 재연결 대상 이름
         val addr: String?           // 재연결 대상 주소
     ): ConnState
-    data class Disconnected(val reason: String?): ConnState
+    data class Connecting(val addr: String): ConnState
+    data class Discovering(val addr: String): ConnState
+    data class Subscribing(val addr: String): ConnState
+    data class Ready(val name: String?, val addr: String): ConnState   // ✅ 새로 추가 (진짜 “연결됨”)
+    data class Disconnected(val reason: String? = null): ConnState
 }
 
 class DualRingBleClient(
@@ -103,6 +107,90 @@ class DualRingBleClient(
         job = null
         scope.launch { resetAll() } // 코루틴만 끊으면 잔여 notify가 남을 수 있어 즉시 안전 분리 시도
     }
+
+//    @SuppressLint("MissingPermission")
+//    suspend fun connectAndSubscribe(
+//        context: Context,
+//        device: BluetoothDevice,
+//        serviceUuid: UUID,
+//        charUuid: UUID,
+//        onSample: (Float) -> Unit,
+//        onState: (ConnState) -> Unit
+//    ) {
+//        val notifyReady = CompletableDeferred<Unit>()
+//        val firstPacket = CompletableDeferred<Unit>()
+//        var gatt: BluetoothGatt? = null
+//        var lastNotifyMs = 0L
+//
+//        withTimeout(15_000) {
+//            onState(ConnState.Connecting(device.address))
+//            gatt = device.connectGatt(context, false, object : BluetoothGattCallback() {
+//
+//                override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+//                    if (status != BluetoothGatt.GATT_SUCCESS || newState != BluetoothProfile.STATE_CONNECTED) {
+//                        onState(ConnState.Disconnected("conn status=$status state=$newState"))
+//                        if (!notifyReady.isCompleted) notifyReady.completeExceptionally(RuntimeException("conn fail"))
+//                        return
+//                    }
+//                    g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+//                    g.requestMtu(247)
+//                    g.discoverServices()
+//                    onState(ConnState.Discovering(device.address))
+//                }
+//
+//                override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+//                    if (status != BluetoothGatt.GATT_SUCCESS) {
+//                        onState(ConnState.Disconnected("discover=$status"))
+//                        if (!notifyReady.isCompleted) notifyReady.completeExceptionally(RuntimeException("discover fail"))
+//                        return
+//                    }
+//                    val svc = g.getService(serviceUuid) ?: return
+//                    val chr = svc.getCharacteristic(charUuid) ?: return
+//
+//                    onState(ConnState.Subscribing(device.address))
+//                    g.setCharacteristicNotification(chr, true)
+//                    val cccd = chr.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+//                    cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+//                    g.writeDescriptor(cccd)
+//                }
+//
+//                override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+//                    if (status == BluetoothGatt.GATT_SUCCESS) {
+//                        if (!notifyReady.isCompleted) notifyReady.complete(Unit)
+//                    }
+//                }
+//
+//                override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+//                    if (characteristic.uuid == charUuid) {
+//                        val bytes = characteristic.value ?: return
+//                        val ppg = parsePpg(bytes) // ✅ 여기서 수신 데이터 파싱 함수 연결
+//                        lastNotifyMs = System.currentTimeMillis()
+//                        onSample(ppg)
+//                        if (!firstPacket.isCompleted) firstPacket.complete(Unit)
+//                    }
+//                }
+//            })
+//        }
+//
+//        withTimeout(5_000) { notifyReady.await() }
+//        withTimeout(5_000) { firstPacket.await() }
+//
+//        onState(ConnState.Ready(gatt?.device?.name, gatt?.device?.address ?: ""))
+//
+//        GlobalScope.launch(Dispatchers.IO) {
+//            while (true) {
+//                delay(1_000)
+//                val gap = System.currentTimeMillis() - lastNotifyMs
+//                if (gap > 3_500) {
+//                    onState(ConnState.Reconnecting(gatt?.device?.address ?: ""))
+//                    try { gatt?.disconnect() } catch (_: Throwable) {}
+//                    try { gatt?.close() } catch (_: Throwable) {}
+//                    break
+//                }
+//            }
+//        }
+//    }
+
 
     /** 외부 공개: 두 센서 모두 안전 분리 (CCCD off → DISABLE → disconnect/close) */
     @SuppressLint("MissingPermission")
@@ -206,6 +294,11 @@ class DualRingBleClient(
                                 val p = f.ppg ?: continue
                                 lastPpgMono = t
                                 out.tryEmit(RawSample(t, p.toFloat()))
+
+                                // ⬇️ 첫 패킷 들어오면 Ready로 승격 (핵심)
+                                if (stateFlowMutable.value[hand] !is ConnState.Ready) {
+                                    setState(hand, ConnState.Ready(device.name, device.address))
+                                }
                             }
                         } catch (_: Throwable) { /* ignore */ }
                     }
@@ -253,11 +346,19 @@ class DualRingBleClient(
                             }
                             return
                         }
+                        // ⬇️ 1.5초 내 무패킷이면 ENABLE 재시도
+                        scope.launch {
+                            delay(1500)
+                            if (lastPpgMono == 0.0) {    // 아직 첫 패킷 없음
+                                writeEnable(g)
+                            }
+                        }
                         val ok = g.writeDescriptor(next)
                         if (!ok) {
                             // 실패 시 다음으로 넘어감(막힘 방지)
                             writeNextCccd(g)
                         }
+
                     }
                 }
 

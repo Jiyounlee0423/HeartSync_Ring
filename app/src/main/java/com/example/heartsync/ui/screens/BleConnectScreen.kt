@@ -1,3 +1,4 @@
+// app/src/main/java/com/example/heartsync/ui/screens/BleConnectScreen.kt
 package com.example.heartsync.ui.screens
 
 import android.Manifest
@@ -8,6 +9,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
@@ -28,6 +30,7 @@ import com.example.heartsync.data.DevicePrefs
 import com.example.heartsync.viewmodel.DualRingViewModel
 import com.example.heartsync.ble.ConnState
 import com.example.heartsync.service.MeasureService
+import androidx.compose.runtime.LaunchedEffect
 
 @Composable
 fun BleConnectScreen(
@@ -35,7 +38,9 @@ fun BleConnectScreen(
     onDone: (() -> Unit)? = null,
     dualVm: DualRingViewModel = viewModel()
 ) {
-    val connStates by dualVm.connStates.collectAsStateWithLifecycle()
+    // 🔹 Dual 연결 상태: 한 번만 수집해서 전역으로 사용
+    val states by dualVm.connStates.collectAsStateWithLifecycle(initialValue = emptyMap())
+
     val scanning by vm.scanning.collectAsStateWithLifecycle()
     val results  by vm.scanResults.collectAsStateWithLifecycle()
     val conn     by vm.connectionState.collectAsStateWithLifecycle()
@@ -48,14 +53,14 @@ fun BleConnectScreen(
     val leftMac  by prefs.leftMac.collectAsStateWithLifecycle(initialValue = null)
     val rightMac by prefs.rightMac.collectAsStateWithLifecycle(initialValue = null)
 
-    val ringStates by dualVm.connStates.collectAsStateWithLifecycle(initialValue = emptyMap())
     val events by vm.events.collectAsState(initial = null)
 
-    // toast for events
+    // toast for events (단발 이벤트)
     LaunchedEffect(events) {
         events?.let { Toast.makeText(ctx, it, Toast.LENGTH_SHORT).show() }
     }
 
+    // 권한
     val requiredPerms = remember {
         val list = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= 31) {
@@ -70,7 +75,15 @@ fun BleConnectScreen(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { }
 
+    // 저장된 MAC 기반으로 DualRing 시작
     LaunchedEffect(Unit) { dualVm.start() }
+
+    LaunchedEffect(leftMac, rightMac) {
+        if (leftMac != null && rightMac != null) {
+            vm.stopScan()                 // 스캔 중이면 끊기 (스캔+연결 동시 진행 방지)
+            dualVm.startWith(leftMac!!, rightMac!!)  // ✅ 좌/우 MAC로 듀얼 연결 시작/재시작
+        }
+    }
 
     Scaffold(
         contentWindowInsets = WindowInsets(0),
@@ -103,33 +116,27 @@ fun BleConnectScreen(
                 }
             )
 
-            // 지정된 기기 상태 요약
+            // 지정된 기기 상태 요약 (Ready 포함)
             Surface(tonalElevation = 2.dp, shape = MaterialTheme.shapes.medium) {
                 Column(Modifier.fillMaxWidth().padding(12.dp)) {
                     Text("지정된 기기", fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(6.dp))
 
-                    val leftState  = connStates["left"]
-                    val rightState = connStates["right"]
+                    val leftState  = states["left"]
+                    val rightState = states["right"]
+
                     val leftStatus = when (val s = leftState) {
+                        is ConnState.Ready        -> "연결완료 (${s.name ?: "Unknown"})"
                         is ConnState.Connected    -> "연결됨 (${s.name ?: "Unknown"})"
-                        is ConnState.Reconnecting -> {
-                            val who = s.name?.takeIf { it.isNotBlank() } ?: ""
-                            "재연결 중${if (s.attempt > 1) " #${s.attempt}" else ""}" +
-                                    (if (who.isNotBlank()) " ($who)" else "")
-                        }
-                        is ConnState.Disconnected -> "끊김"
+                        is ConnState.Reconnecting -> "재연결 중${if (s.attempt>1) " #${s.attempt}" else ""}${s.name?.let{ " ($it)"}?: ""}"
+                        is ConnState.Disconnected -> "끊김${s.reason?.let{ " ($it)"}?: ""}"   // ✅ 이유 표시
                         else -> if (leftMac != null) "등록됨" else "미지정"
                     }
-
                     val rightStatus = when (val s = rightState) {
+                        is ConnState.Ready        -> "연결완료 (${s.name ?: "Unknown"})"
                         is ConnState.Connected    -> "연결됨 (${s.name ?: "Unknown"})"
-                        is ConnState.Reconnecting -> {
-                            val who = s.name?.takeIf { it.isNotBlank() } ?: ""
-                            "재연결 중${if (s.attempt > 1) " #${s.attempt}" else ""}" +
-                                    (if (who.isNotBlank()) " ($who)" else "")
-                        }
-                        is ConnState.Disconnected -> "끊김"
+                        is ConnState.Reconnecting -> "재연결 중${if (s.attempt>1) " #${s.attempt}" else ""}${s.name?.let{ " ($it)"}?: ""}"
+                        is ConnState.Disconnected -> "끊김${s.reason?.let{ " ($it)"}?: ""}"   // ✅ 이유 표시
                         else -> if (rightMac != null) "등록됨" else "미지정"
                     }
 
@@ -163,40 +170,40 @@ fun BleConnectScreen(
                         scope.launch {
                             // 1) 저장된 좌/우 MAC 제거
                             prefs.clear()
-
                             // 2) 듀얼 클라이언트: 두 센서 동시 안전 분리
                             dualVm.resetAll()
-
                             // 3) (단일 모드 측정 서비스가 살아있다면) 강제 리셋
                             val intent = Intent(ctx, MeasureService::class.java)
                                 .setAction(MeasureService.ACTION_RESET_ALL)
                             ctx.startService(intent)
-
                             snackbar.showSnackbar("블루투스 연결을 초기화했어요.")
+                            vm.startScan()
                         }
                     },
                     modifier = Modifier.weight(1f).height(48.dp)
                 ) { Text("초기화") }
 
+                // ✅ 완료 조건: 양손이 Ready일 때만
+                val leftReady  = states["left"]  is ConnState.Ready
+                val rightReady = states["right"] is ConnState.Ready
+
                 Button(
                     onClick = {
-                        val leftOk  = ringStates["left"]  is ConnState.Connected
-                        val rightOk = ringStates["right"] is ConnState.Connected
                         when {
                             leftMac == null || rightMac == null ->
                                 scope.launch { snackbar.showSnackbar("왼손/오른손을 모두 지정하세요.") }
-                            leftOk && rightOk -> onDone?.invoke()
+                            leftReady && rightReady -> onDone?.invoke()
                             else -> {
                                 val failSides = buildList {
-                                    if (!leftOk) add("왼손")
-                                    if (!rightOk) add("오른손")
+                                    if (!leftReady) add("왼손")
+                                    if (!rightReady) add("오른손")
                                 }.joinToString(", ")
-                                scope.launch { snackbar.showSnackbar("$failSides 연결이 아직 완료되지 않았습니다.") }
+                                scope.launch { snackbar.showSnackbar("$failSides 준비가 아직 완료되지 않았습니다.") }
                             }
                         }
                     },
                     modifier = Modifier.weight(1f).height(48.dp),
-                    enabled = leftMac != null && rightMac != null
+                    enabled = leftReady && rightReady
                 ) { Text("완료") }
             }
         }
@@ -259,3 +266,4 @@ private fun DeviceSelectList(
         }
     }
 }
+

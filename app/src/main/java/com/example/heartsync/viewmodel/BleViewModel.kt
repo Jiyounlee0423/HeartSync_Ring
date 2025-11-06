@@ -6,6 +6,8 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.heartsync.ble.PpgBleClient
+import com.example.heartsync.ble.DualRingBleClient
+import com.example.heartsync.ble.ConnState
 import com.example.heartsync.data.model.BleDevice
 import com.example.heartsync.data.model.GraphState
 import com.example.heartsync.data.remote.PpgRepository
@@ -16,11 +18,13 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
-
-
 class BleViewModel(app: Application) : AndroidViewModel(app) {
 
+    // 단일(테스트) 연결용 기존 클라이언트
     private val client = PpgBleClient(app)
+
+    // 듀얼 연결 전용 클라이언트 (선택 후 생성)
+    private var dualClient: DualRingBleClient? = null
 
     private val _graphState = MutableStateFlow(GraphState())
     val graphState: StateFlow<GraphState> = _graphState.asStateFlow()
@@ -35,6 +39,10 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
         MutableStateFlow<PpgBleClient.ConnectionState>(PpgBleClient.ConnectionState.Disconnected)
     val connectionState: StateFlow<PpgBleClient.ConnectionState> = _connectionState.asStateFlow()
 
+    // 듀얼 연결 상태(left/right)
+    private val _dualStates = MutableStateFlow<Map<String, ConnState>>(emptyMap())
+    val dualStates: StateFlow<Map<String, ConnState>> = _dualStates.asStateFlow()
+
     /** 팝업용 ALERT 스트림 (Repo가 event=ALERT & side=left/right만 방출) */
     val alerts: SharedFlow<PpgRepository.UiAlert> = PpgRepository.instance.alerts
 
@@ -45,6 +53,7 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
     private var scanJob: Job? = null
     private var connJob: Job? = null
     private var fsJob: Job? = null
+    private var dualJob: Job? = null
 
     private val MAX_GRAPH_POINTS = 512
 
@@ -103,7 +112,7 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
         client.stopScan()
     }
 
-    /** 단일 연결 (DualRing과 별개) */
+    /** 단일 연결 (테스트용) */
     fun connect(device: BleDevice) {
         stopScan()
         client.connect(device)
@@ -119,6 +128,7 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
         connJob?.cancel()
         clearGraph()
         fsJob?.cancel()
+        stopDualConnect()
     }
 
     /** 좌/우 기기 선택 */
@@ -140,6 +150,60 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
         return true
     }
 
+    /** 듀얼 연결 시작: DualRingBleClient를 생성하고 상태를 구독 */
+    fun startDualConnect() {
+        val l = leftSel
+        val r = rightSel
+        if (l == null || r == null) {
+            viewModelScope.launch { _events.send("왼손과 오른손 기기를 모두 선택해 주세요.") }
+            return
+        }
+        if (l.address.equals(r.address, ignoreCase = true)) {
+            viewModelScope.launch { _events.send("같은 기기를 좌/우에 지정할 수 없습니다.") }
+            return
+        }
+
+        stopScan() // 스캔 중지
+        stopDualConnect() // 기존 듀얼 세션 종료
+
+        dualClient = DualRingBleClient(
+            ctx = getApplication(),
+            scope = viewModelScope,
+            leftMac = l.address,
+            rightMac = r.address,
+            leftNamePrefix = "R02_",
+            rightNamePrefix = "R02_",
+            stallTimeoutSec = 5.0
+        )
+
+        // 상태 구독
+        dualJob = dualClient!!.connStates
+            .onEach { st -> _dualStates.value = st }
+            .launchIn(viewModelScope)
+
+        // 시작
+        dualClient!!.start()
+    }
+
+    /** 듀얼 연결 중지 */
+    fun stopDualConnect() {
+        dualJob?.cancel()
+        dualJob = null
+        dualClient?.let { c ->
+            viewModelScope.launch { c.resetAll() }
+        }
+        dualClient = null
+        _dualStates.value = emptyMap()
+    }
+
+    /** 두 손 모두 Ready인지 여부 (UI에서 완료 버튼 활성화 조건으로 사용) */
+    fun bothHandsReady(): Boolean {
+        val m = _dualStates.value
+        val leftReady = m["left"] is ConnState.Ready
+        val rightReady = m["right"] is ConnState.Ready
+        return leftReady && rightReady
+    }
+
     /** 전체 초기화: BLE 연결 및 선택 해제 */
     fun resetBle() {
         val ctx = getApplication<Application>()
@@ -149,6 +213,7 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
         leftSel = null
         rightSel = null
         clearGraph()
+        stopDualConnect()
         viewModelScope.launch { _events.send("BLE 연결을 초기화했습니다.") }
     }
 
@@ -156,17 +221,18 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
         _graphState.value = GraphState()
     }
 
-
     override fun onCleared() {
         super.onCleared()
         scanJob?.cancel()
         connJob?.cancel()
         fsJob?.cancel()
+        dualJob?.cancel()
         client.stopScan()
         client.disconnect()
+        dualClient?.let { viewModelScope.launch { it.resetAll() } }
     }
 
-    /** 연결된 기기로 측정 시작 */
+    /** 연결된 기기로 측정 시작 (단일 측정용) */
     fun startMeasure(device: BleDevice) {
         val ctx = getApplication<Application>()
         val it = Intent(ctx, MeasureService::class.java).apply {

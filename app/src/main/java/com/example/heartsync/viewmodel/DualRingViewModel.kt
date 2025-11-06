@@ -1,3 +1,4 @@
+// app/src/main/java/com/example/heartsync/viewmodel/DualRingViewModel.kt
 package com.example.heartsync.viewmodel
 
 import android.app.Application
@@ -57,11 +58,15 @@ class DualRingViewModel(app: Application) : AndroidViewModel(app) {
     val ppgfLeft:  StateFlow<List<Pair<Float, Float>>>  = _ppgfLeft
     val ppgfRight: StateFlow<List<Pair<Float, Float>>>  = _ppgfRight
 
-    /** 양쪽 모두 연결되어 있을 때만 true → 홈 그래프 표시 제어 용도 */
+    /** 양쪽 모두 Connected(연결만 성립) */
     val bothConnected: StateFlow<Boolean> = connStates
-        .map { m ->
-            (m["left"]  is ConnState.Connected) && (m["right"] is ConnState.Connected)
-        }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
+        .map { m -> (m["left"] is ConnState.Connected) && (m["right"] is ConnState.Connected) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /** 양쪽 모두 Ready(Notify+첫샘플 완료) */
+    val bothReady: StateFlow<Boolean> = connStates
+        .map { m -> (m["left"] is ConnState.Ready) && (m["right"] is ConnState.Ready) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     // ====== VM 내부 경량 DC→MA 필터 ======
     private class StreamingDCMA(
@@ -236,5 +241,15 @@ class DualRingViewModel(app: Application) : AndroidViewModel(app) {
     /** 두 센서 동시 안전 분리(요청형) — UI '초기화' 버튼에서 사용 */
     fun resetAll() {
         viewModelScope.launch { client?.resetAll() }
+    }
+
+    /** 좌/우 MAC을 직접 받아 즉시 듀얼 연결 시작(화면에서 지정 직후 사용) */
+    fun startWith(leftMac: String, rightMac: String) {
+        // prefs에도 반영(다음 실행/재시작에 대비)
+        viewModelScope.launch {
+            prefs.setLeft(leftMac)
+            prefs.setRight(rightMac)
+        }
+        restart(leftMac, rightMac)
     }
 }
