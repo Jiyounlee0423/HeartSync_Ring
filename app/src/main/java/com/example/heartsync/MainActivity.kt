@@ -84,15 +84,15 @@ class MainActivity : ComponentActivity() {
                 .collection("users").document(uid)
                 .collection("health").document("ping")
 
-            val sessionId = com.example.heartsync.data.remote.PpgRepository
-                .instance
-                .getSessionId() ?: run {
-                android.util.Log.w("Main", "sessionId is null (MeasureService가 아직 설정 전)")
-                return@launch
-            }
+//            val sessionId = com.example.heartsync.data.remote.PpgRepository
+//                .instance
+//                .getSessionId() ?: run {
+//                android.util.Log.w("Main", "sessionId is null (MeasureService가 아직 설정 전)")
+//                return@launch
+//            }
 
             // 4) Firestore 기반 그래프 수집 시작
-            bleVm.startFirestoreGraph(uid = uid, sessionId = sessionId, limit = 512L)
+            //bleVm.startFirestoreGraph(uid = uid, sessionId = sessionId, limit = 512L)
 
             runCatching {
                 ref.set(mapOf("ok" to true, "at" to System.currentTimeMillis())).await()

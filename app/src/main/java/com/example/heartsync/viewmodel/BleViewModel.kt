@@ -17,11 +17,16 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import com.example.heartsync.service.DualRingProcessorBridge
+import com.google.firebase.auth.FirebaseAuth
+
+
 
 class BleViewModel(app: Application) : AndroidViewModel(app) {
 
     // 단일(테스트) 연결용 기존 클라이언트
     private val client = PpgBleClient(app)
+    private var metricBridge: DualRingProcessorBridge? = null
 
     // 듀얼 연결 전용 클라이언트 (선택 후 생성)
     private var dualClient: DualRingBleClient? = null
@@ -163,8 +168,8 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
 
-        stopScan() // 스캔 중지
-        stopDualConnect() // 기존 듀얼 세션 종료
+        stopScan()           // 스캔 중지
+        stopDualConnect()    // 기존 듀얼 세션/브릿지/FS 구독 종료
 
         dualClient = DualRingBleClient(
             ctx = getApplication(),
@@ -181,12 +186,35 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
             .onEach { st -> _dualStates.value = st }
             .launchIn(viewModelScope)
 
-        // 시작
+        // 1) 듀얼 연결 시작
         dualClient!!.start()
+
+        // 2) 세션ID 설정 + 브릿지 시작(동일 엔진으로 지표 계산 & Firestore 저장)
+        PpgRepository.default().setSessionId(makeSessionId())
+        metricBridge = DualRingProcessorBridge(PpgRepository.default(), fsHz = 50).also { bridge ->
+            dualClient?.let { bridge.start(it) }
+        }
+
+        // 3) Firestore 그래프 구독 자동 시작 (세션ID/uid 준비 완료 시점)
+        val uid = FirebaseAuth.getInstance().currentUser?.uid
+        val sid = PpgRepository.instance.getSessionId()
+        if (uid != null && sid != null) {
+            startFirestoreGraph(uid = uid, sessionId = sid, limit = 512L)
+        } else {
+            Log.w("BleVM", "skip startFirestoreGraph: uid=$uid, sessionId=$sid")
+        }
     }
 
     /** 듀얼 연결 중지 */
     fun stopDualConnect() {
+        // 브릿지 먼저 중단
+        metricBridge?.stop()
+        metricBridge = null
+
+        // Firestore 그래프 구독 중단
+        fsJob?.cancel()
+        fsJob = null
+
         dualJob?.cancel()
         dualJob = null
         dualClient?.let { c ->
@@ -195,6 +223,7 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
         dualClient = null
         _dualStates.value = emptyMap()
     }
+
 
     /** 두 손 모두 Ready인지 여부 (UI에서 완료 버튼 활성화 조건으로 사용) */
     fun bothHandsReady(): Boolean {
@@ -249,5 +278,9 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
     fun stopMeasure() {
         val ctx = getApplication<Application>()
         ctx.stopService(Intent(ctx, MeasureService::class.java))
+    }
+    private fun makeSessionId(): String {
+        val sdf = java.text.SimpleDateFormat("S_yyyyMMdd_HHmmss", java.util.Locale.US)
+        return sdf.format(java.util.Date())
     }
 }

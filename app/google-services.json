@@ -1,13 +1,13 @@
 {
   "project_info": {
-    "project_number": "1076939974673",
-    "project_id": "heartsync-517ae",
-    "storage_bucket": "heartsync-517ae.firebasestorage.app"
+    "project_number": "154180286725",
+    "project_id": "heartsync-ring",
+    "storage_bucket": "heartsync-ring.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:1076939974673:android:5818de5b0847a55a7fe9b0",
+        "mobilesdk_app_id": "1:154180286725:android:b03980eed3a061a2225f6c",
         "android_client_info": {
           "package_name": "com.example.heartsync"
         }
@@ -15,7 +15,7 @@
       "oauth_client": [],
       "api_key": [
         {
-          "current_key": "AIzaSyAzG05oEQUkaLmuYFasb-Zwq-yQ3CB4MnI"
+          "current_key": "AIzaSyA78rvbHOLa_voSHL-yg7MMaSMHgIZGCzY"
         }
       ],
       "services": {
