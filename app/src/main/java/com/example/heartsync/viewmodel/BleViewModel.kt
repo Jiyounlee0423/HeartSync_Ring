@@ -191,9 +191,7 @@ class BleViewModel(app: Application) : AndroidViewModel(app) {
 
         // 2) 세션ID 설정 + 브릿지 시작(동일 엔진으로 지표 계산 & Firestore 저장)
         PpgRepository.default().setSessionId(makeSessionId())
-        metricBridge = DualRingProcessorBridge(PpgRepository.default(), fsHz = 50).also { bridge ->
-            dualClient?.let { bridge.start(it) }
-        }
+        metricBridge = DualRingProcessorBridge(PpgRepository.default())
 
         // 3) Firestore 그래프 구독 자동 시작 (세션ID/uid 준비 완료 시점)
         val uid = FirebaseAuth.getInstance().currentUser?.uid

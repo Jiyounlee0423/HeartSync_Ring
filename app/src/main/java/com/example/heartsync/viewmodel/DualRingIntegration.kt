@@ -15,7 +15,7 @@ class DualRingIntegration : ViewModel() {
     fun start(client: DualRingBleClient) {
         if (bridge != null) return
         PpgRepository.default().setSessionId(makeSessionId())
-        bridge = DualRingProcessorBridge(PpgRepository.default(), fsHz = 50).also { it.start(client) }
+        val bridge = DualRingProcessorBridge(PpgRepository.default())
     }
 
     fun stop() {

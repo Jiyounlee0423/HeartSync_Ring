@@ -136,9 +136,9 @@ fun DataVizScreen(
         vm.startListenDayMetrics(
             uid = uid,   // ← 여기 중요! uid로 전달
             date = selectedDate,
-            ampField = "AmpRatio",
-            padField = "PAD_ms",
-            dSutField = "dSUT_ms\n"
+            ampField = "AUSPR",
+            padField = "PWTT",
+            dSutField = "HSI\n"
         )
     }
     DisposableEffect(Unit) { onDispose { vm.stopAll() } }
@@ -188,9 +188,9 @@ private fun MetricsRow(metrics: DayMetrics?) {
         verticalArrangement = Arrangement.spacedBy(2.dp),
         contentPadding = PaddingValues(vertical = 4.dp)
     ) {
-        item { StatCard("AmpRatio", metrics?.ampRatio) }
-        item { StatCard("PAD",      metrics?.padMs) }
-        item { StatCard("dSUT",     metrics?.dSutMs) }
+        item { StatCard("AUSPR (ratio)", metrics?.ampRatio) }
+        item { StatCard("PWTT (ms)",      metrics?.padMs) }
+        item { StatCard("HSI",     metrics?.dSutMs) }
     }
 }
 @Composable

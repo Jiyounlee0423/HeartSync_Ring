@@ -15,29 +15,22 @@ import java.util.ArrayDeque
  * HeartSync_1102-main과 동일한 "STAT/ALERT" 라인으로 Firestore에 저장한다.
  */
 class DualRingProcessorBridge(
-    private val repo: PpgRepository,
-    private val fsHz: Int = 50
+    private val repo: PpgRepository = PpgRepository.instance
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val TAG = "DualRingBridge"
+
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var job: Job? = null
 
-    private val bufL = ArrayDeque<Pair<Double, Double>>() // (tMonoS, val)
+    // 최근 좌/우 샘플 버퍼 (모노토닉 초, PPG값)
+    private val bufL = ArrayDeque<Pair<Double, Double>>()
     private val bufR = ArrayDeque<Pair<Double, Double>>()
+    private var lastL: Pair<Double, Double>? = null
+    private var lastR: Pair<Double, Double>? = null
 
-    @Volatile private var lastL: Pair<Double, Double>? = null
-    @Volatile private var lastR: Pair<Double, Double>? = null
-
+    // On-device processor (네 프로젝트 시그니처 기준)
     private val proc = OnDeviceProcessor(
-        fsHz = fsHz,
-        dcWinSec = 0.8,                              // OK (기본 1.5, 필요시 조정)
-        smoothN = (0.20 * fsHz).toInt().coerceAtLeast(1), // ← 핵심: 0.20초 창 = 샘플 개수
-        foiAlpha = 0.1,
-        ausprSmoothK = 5,
-        ausprClampLow = 0.5,
-        ausprClampHigh = 2.0,
-        minPeakProm = 30.0,
-        refractSec = 0.35,
-        pairTolSec = 0.120,
+        fsHz = 50,          // Int
         minRtMs = 90.0,
         hsiTdBase = 60.0,
         hsiTdScale = 30.0,
@@ -46,32 +39,51 @@ class DualRingProcessorBridge(
         ausprBand = 0.30
     )
 
-
     fun start(dual: DualRingBleClient) {
         stop()
+
+        // ✅ Auto session: 브릿지 시작 시 자동 세션 생성
+        try {
+            val uid = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.uid
+            if (uid != null) {
+                val sid = java.time.OffsetDateTime.now(java.time.ZoneOffset.UTC)
+                    .toString().replace(":", "-") + "_" + java.util.UUID.randomUUID().toString().take(8)
+                repo.setSessionId(sid)
+                // 세션 메타는 fire-and-forget
+                PpgRepository.instance.putSessionMetaFireAndForget(uid, sid)
+                Log.d(TAG, "auto session started sid=$sid")
+            } else {
+                Log.e(TAG, "auto session skipped: not signed in")
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "auto session init fail", t)
+        }
 
         val c1 = scope.launch {
             dual.leftFlow.collect { s ->
                 lastL = s.tMonoS to s.ppg.toDouble()
                 bufL.addLast(lastL!!)
-                trimOld(bufL, keepSec = 3.0)
+                trimOld(bufL, 3.0)
             }
         }
         val c2 = scope.launch {
             dual.rightFlow.collect { s ->
                 lastR = s.tMonoS to s.ppg.toDouble()
                 bufR.addLast(lastR!!)
-                trimOld(bufR, keepSec = 3.0)
+                trimOld(bufR, 3.0)
             }
         }
 
-        val dt = 1.0 / fsHz
         job = scope.launch {
             var t0: Double? = null
-            var tick: Long = 0
+            var tick = 0L
+            val fsHz = 50.0                 // 처리 주파수(더블)
+            val dt = 1.0 / fsHz
 
             while (isActive) {
-                delay((1000L / fsHz).coerceAtLeast(10L))
+                // 🔧 delay에 Long 필요 → periodMs를 Long으로 변환
+                val periodMs = (1000.0 / fsHz).coerceAtLeast(10.0).toLong()
+                delay(periodMs)
 
                 val l = lastL
                 val r = lastR
@@ -95,6 +107,8 @@ class DualRingProcessorBridge(
                 }
             }
         }
+        // c1/c2는 경고만; Job은 scope에 붙어 있어 stop()에서 함께 정리돼요.
+        @Suppress("UNUSED_VARIABLE") val _keepRefs = arrayOf(c1, c2)
     }
 
     fun stop() {

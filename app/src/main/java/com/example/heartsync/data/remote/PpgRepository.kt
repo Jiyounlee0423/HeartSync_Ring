@@ -2,6 +2,7 @@
 package com.example.heartsync.data.remote
 
 import android.util.Log
+import com.example.heartsync.util.SessionManager
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.*
 import kotlinx.coroutines.channels.awaitClose
@@ -68,6 +69,7 @@ private fun docToRecord(data: Map<String, Any?>): PpgRecord {
         else -> emptyList()
     }
 
+
     return PpgRecord(
         ts = asLong(data["ts"]) ?: asLong(data["timestamp"]) ?: asLong(data["time"]),
         smoothed_left  = asDouble(data["smoothed_left"]) ?: asDouble(data["PPGf_L"]),
@@ -78,6 +80,47 @@ private fun docToRecord(data: Map<String, Any?>): PpgRecord {
         reasons     = asReasons(data["reasons"] ?: data["Reasons"] ?: data["reason"])
     )
 }
+
+data class PpgMetric(
+    val ts: Long,
+    val side: String,           // "L" | "R"
+    val pwtt_ms: Double?,
+    val auspr: Double?,
+    val hsi: Double?,
+    val amp_ratio_norm: Double?,
+    val dir_amp: String?        // "L"|"R"|null
+)
+
+fun saveMetric(m: PpgMetric) {
+    val uid = FirebaseAuth.getInstance().currentUser?.uid ?: run {
+        Log.e("FS","saveMetric: not signed in"); return
+    }
+    val sid = SessionManager.currentSid ?: run {
+        Log.e("FS","saveMetric: no currentSid"); return
+    }
+    val db = FirebaseFirestore.getInstance()
+
+    val col = db.collection("ppg_events").document(uid)
+        .collection("sessions").document(sid)
+        .collection("records")
+
+    val data = hashMapOf(
+        "ts_client" to m.ts,
+        "ts_server" to FieldValue.serverTimestamp(),
+        "side" to m.side,
+        "pwtt_ms" to m.pwtt_ms,
+        "auspr" to m.auspr,
+        "hsi" to m.hsi,
+        "amp_ratio_norm" to m.amp_ratio_norm,
+        "dir_amp" to m.dir_amp
+    )
+
+    Log.d("FS", "saveMetric PATH=${col.path}")
+    col.add(data)
+        .addOnSuccessListener { Log.d("FS", "saveMetric ok id=${it.id}") }
+        .addOnFailureListener { e -> Log.e("FS", "saveMetric fail", e) }
+}
+
 
 /* =========================
  *  업로드/관측에 쓰는 이벤트 DTO
@@ -224,6 +267,32 @@ class PpgRepository(
             recordRegs.forEach { it.remove() }
         }
     }.distinctUntilChanged()
+    fun startNewSession(
+        title: String = "Baseline/Pressure/Recovery",
+        device: String = "R02",
+        onReady: (String) -> Unit,
+        onFail: (String) -> Unit
+    ) {
+        val auth = FirebaseAuth.getInstance()
+        val uid = auth.currentUser?.uid ?: return onFail("로그인 필요")
+        val db = FirebaseFirestore.getInstance()
+
+        val sid = System.currentTimeMillis().toString()  // 세션ID
+        SessionManager.currentSid = sid
+
+        val meta = mapOf(
+            "created_at" to FieldValue.serverTimestamp(),
+            "title" to title,
+            "device" to device
+        )
+
+        db.collection("ppg_events").document(uid)
+            .collection("sessions").document(sid)
+            .set(meta)
+            .addOnSuccessListener { onReady(sid) }
+            .addOnFailureListener { e -> onFail("세션 생성 실패: ${e.message}") }
+    }
+
 
     /* ============================================================
      *  B) 라인 저장 / 실시간 값 전달

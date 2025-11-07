@@ -42,6 +42,7 @@ import kotlinx.coroutines.tasks.await
 import androidx.lifecycle.lifecycleScope
 import com.example.heartsync.data.remote.PpgRepository
 import com.google.firebase.FirebaseApp
+import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.launch
 
@@ -55,6 +56,59 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        FirebaseApp.initializeApp(this)
+        // 어디든 onCreate/onStart 등에서 1회 실행
+//        FirebaseFirestore.getInstance()
+//            .collectionGroup("records")
+//            .limit(5)
+//            .get()
+//            .addOnSuccessListener { qs ->
+//                android.util.Log.d("FS", "records found=${qs.size()}")
+//                qs.documents.forEach { d ->
+//                    android.util.Log.d("FS", "FOUND path=${d.reference.path} data=${d.data}")
+//                }
+//            }
+//            .addOnFailureListener { e -> android.util.Log.e("FS", "group query fail", e) }
+
+
+        // 1️⃣ Firestore 로그 활성화 + 네트워크 강제 ON
+        val db = FirebaseFirestore.getInstance()
+        FirebaseFirestore.setLoggingEnabled(true)
+        db.enableNetwork()
+        db.collectionGroup("records")
+            .limit(1)
+            .addSnapshotListener { qs, e ->
+                if (e != null) {
+                    Log.e("FS", "snap err", e); return@addSnapshotListener
+                }
+                if (qs == null) return@addSnapshotListener
+                Log.d("FS", "snap size=${qs.size()} fromServer=${!qs.metadata.isFromCache} pending=${qs.metadata.hasPendingWrites()}")
+                for (d in qs.documents) {
+                    Log.d("FS", "doc ${d.id} pending=${d.metadata.hasPendingWrites()} data=${d.data}")
+                }
+            }
+
+        // 2️⃣ 로그인 후 더미 문서 저장 시도
+        val uid = FirebaseAuth.getInstance().currentUser?.uid
+        Log.d("AUTH", "uid=$uid")
+
+        if (uid != null) {
+            val path = "ppg_events/$uid/sessions/TEST_SESSION/records"
+            Log.d("FS", "WRITE PATH=$path")
+
+            db.collection(path).add(
+                mapOf(
+                    "ts_client" to System.currentTimeMillis(),
+                    "ts_server" to FieldValue.serverTimestamp(),
+                    "probe" to true
+                )
+            )
+                .addOnSuccessListener { Log.d("FS", "write ok id=${it.id}") }
+                .addOnFailureListener { e -> Log.e("FS", "write fail", e) }
+        } else {
+            Log.e("FS", "no uid — 로그인 후 테스트 필요")
+        }
 
         lifecycleScope.launch {
             val auth = FirebaseAuth.getInstance()
@@ -144,6 +198,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+
+
     }
 
     /**
