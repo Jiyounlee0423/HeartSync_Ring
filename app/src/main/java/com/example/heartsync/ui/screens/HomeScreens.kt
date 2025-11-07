@@ -204,8 +204,9 @@ fun HomeScreen(
             }
 
             // ===== 그래프는 "양쪽 모두 연결"일 때만 표시 =====
+            // yFixed: Y축 범위
             if (isConnected) {
-                HomeGraphSection(points = pointsDisplay, window = window)
+                HomeGraphSection(points = pointsDisplay, window = window, yFixed = -50.0..50.0)
             } else {
                 Box(
                     modifier = Modifier
@@ -371,7 +372,8 @@ class HomeVmFactory(
 @Composable
 fun HomeGraphSection(
     points: List<PpgPoint>,
-    window: Int = 600
+    window: Int = 600,
+    yFixed: ClosedFloatingPointRange<Double>? = null   // ← 추가
 ) {
     if (points.isEmpty()) {
         Box(
@@ -386,16 +388,23 @@ fun HomeGraphSection(
     // 1) 윈도우 자르기
     val slice = if (points.size > window) points.takeLast(window) else points
 
-    // 2) Y범위 계산(좌/우 합쳐서)
-    val ys = slice.flatMap { listOfNotNull(it.left, it.right) }
-    val (yLo, yHi) = if (ys.isNotEmpty()) {
-        val minY = ys.minOrNull()!!
-        val maxY = ys.maxOrNull()!!
-        if (minY == maxY) (minY - 1.0) to (maxY + 1.0) else {
-            val pad = (maxY - minY) * 0.05
-            (minY - pad) to (maxY + pad)
-        }
-    } else 0.0 to 1.0
+    // 2) Y범위: yFixed가 주어지면 그대로 사용, 아니면 기존 자동 계산
+    val (yLo, yHi) = if (yFixed != null) {
+        // 혹시 start > end 들어오면 정렬
+        val a = minOf(yFixed.start, yFixed.endInclusive)
+        val b = maxOf(yFixed.start, yFixed.endInclusive)
+        a to b
+    } else {
+        val ys = slice.flatMap { listOfNotNull(it.left, it.right) }
+        if (ys.isNotEmpty()) {
+            val minY = ys.minOrNull()!!
+            val maxY = ys.maxOrNull()!!
+            if (minY == maxY) (minY - 1.0) to (maxY + 1.0) else {
+                val pad = (maxY - minY) * 0.05
+                (minY - pad) to (maxY + pad)
+            }
+        } else 0.0 to 1.0
+    }
     val ySpan = (yHi - yLo).let { if (it <= 1e-9) 1.0 else it } // 분모 0 방지
 
     // 3) 색상(Compose 밖에서 미리 뽑기)
